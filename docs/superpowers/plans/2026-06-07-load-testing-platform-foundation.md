@@ -76,6 +76,7 @@ frontend/
 
 **Files:**
 
+- Modify: `.gitignore`
 - Create: `backend/go.mod`
 - Create: `frontend/package.json`
 - Create: `frontend/index.html`
@@ -83,6 +84,17 @@ frontend/
 - Create: `frontend/tsconfig.node.json`
 - Create: `frontend/vite.config.ts`
 - Create: `frontend/vitest.setup.ts`
+
+- [ ] **Step 0: Ignore local dependency and build output directories**
+
+Modify `.gitignore`:
+
+```gitignore
+.worktrees/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+```
 
 - [ ] **Step 1: Create backend module configuration**
 
@@ -122,13 +134,14 @@ Create `frontend/package.json`:
     "@testing-library/jest-dom": "^6.6.0",
     "@testing-library/react": "^15.0.7",
     "@testing-library/user-event": "^14.6.0",
+    "@types/node": "^24.0.0",
     "@types/react": "^18.3.20",
     "@types/react-dom": "^18.3.6",
     "@vitejs/plugin-react": "^4.5.0",
     "jsdom": "^26.1.0",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.0"
   }
 }
 ```
@@ -173,6 +186,7 @@ Create `frontend/tsconfig.json`:
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo",
     "jsx": "react-jsx",
     "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
@@ -187,9 +201,15 @@ Create `frontend/tsconfig.node.json`:
 {
   "compilerOptions": {
     "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "outDir": "./node_modules/.tmp/tsconfig.node",
+    "target": "ES2022",
+    "lib": ["ES2022"],
     "module": "ESNext",
-    "moduleResolution": "Node",
-    "allowSyntheticDefaultImports": true
+    "moduleResolution": "Bundler",
+    "allowSyntheticDefaultImports": true,
+    "types": ["node"],
+    "skipLibCheck": true
   },
   "include": ["vite.config.ts"]
 }
@@ -234,7 +254,7 @@ cd backend
 go test ./...
 ```
 
-Expected: command exits with code 0 and either reports no packages or no test failures.
+Expected: no backend test failures. If Go reports `matched no packages` before Task 2 creates the first package, treat that as a non-blocking empty-module result and continue.
 
 Run:
 
@@ -249,7 +269,7 @@ Expected: command exits with code 0.
 - [ ] **Step 7: Commit tooling**
 
 ```bash
-git add backend/go.mod frontend/package.json frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts frontend/vitest.setup.ts
+git add .gitignore backend/go.mod backend/go.sum frontend/package.json frontend/package-lock.json frontend/index.html frontend/tsconfig.json frontend/tsconfig.node.json frontend/vite.config.ts frontend/vitest.setup.ts
 git commit -m "chore: add backend and frontend test tooling"
 ```
 
