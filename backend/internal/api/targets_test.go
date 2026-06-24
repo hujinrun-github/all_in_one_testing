@@ -12,10 +12,10 @@ import (
 func TestTargetPersistsAgentBinding(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
 	router := NewRouter()
-	token := createAgentToken(t, router)
+	token := createScopedAgentToken(t, router, "checkout-prod-install", "default", "prod")
 
 	heartbeatResponse := httptest.NewRecorder()
-	router.ServeHTTP(heartbeatResponse, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token, `{
+	router.ServeHTTP(heartbeatResponse, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token.Token, `{
 		"name": "checkout-01",
 		"hostname": "checkout-host-01",
 		"ip": "10.0.0.13",

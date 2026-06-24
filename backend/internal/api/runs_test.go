@@ -1255,7 +1255,7 @@ func TestCreateRunUsesTargetBaseURLForSavedScenario(t *testing.T) {
 	router.ServeHTTP(createScenarioResponse, httptest.NewRequest(http.MethodPost, "/api/scenarios", bytes.NewBufferString(`{
 		"name": "saved-target-checkout",
 		"projectId": "project-checkout",
-		"environment": "staging",
+		"environment": "prod",
 		"protocol": "HTTP",
 		"method": "GET",
 		"baseUrl": "http://scenario.example.invalid",
@@ -1411,7 +1411,7 @@ func TestCreateRunRejectsUnhealthyTargetPreflight(t *testing.T) {
 	router.ServeHTTP(createTargetResponse, httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{
 		"name": "checkout-target",
 		"baseUrl": "`+target.URL+`",
-		"environment": "test",
+		"environment": "default",
 		"agentIds": [],
 		"profileEndpoint": "",
 		"processMatch": { "name": "checkout", "cmdlineContains": "" },
@@ -1530,7 +1530,7 @@ func TestCreateRunCapturesTargetProfileArtifact(t *testing.T) {
 	router.ServeHTTP(createTargetResponse, httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{
 		"name": "profiled-target",
 		"baseUrl": "`+target.URL+`",
-		"environment": "test",
+		"environment": "default",
 		"agentIds": [],
 		"profileEndpoint": "`+target.URL+`/debug/pprof",
 		"processMatch": { "name": "checkout", "cmdlineContains": "" }
@@ -1634,7 +1634,7 @@ func TestCreateRunSchedulesAgentProfileTaskForBoundTarget(t *testing.T) {
 	router.ServeHTTP(createTargetResponse, httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{
 		"name": "checkout-target",
 		"baseUrl": "`+target.URL+`",
-		"environment": "test",
+		"environment": "default",
 		"agentIds": ["agent-checkout-01"],
 		"profileEndpoint": "http://127.0.0.1:6060/debug/pprof",
 		"processMatch": {
@@ -1751,7 +1751,7 @@ func TestCreateRunSchedulesThresholdProfileTaskWhenTargetMetricsExceedThreshold(
 	router.ServeHTTP(createTargetResponse, httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{
 		"name": "threshold-target",
 		"baseUrl": "`+target.URL+`",
-		"environment": "test",
+		"environment": "default",
 		"agentIds": ["agent-threshold-01"],
 		"profileEndpoint": "http://127.0.0.1:6060/debug/pprof",
 		"processMatch": {
@@ -2091,7 +2091,7 @@ func TestRunEventsTrackStartProgressAndFinish(t *testing.T) {
 		t.Fatal("expected second request to start and block")
 	}
 
-	runningEvents := listRunEvents(t, router, created.ID)
+	runningEvents := waitForRunEventType(t, router, created.ID, "run_progress")
 	assertRunEventType(t, runningEvents, "run_started")
 	progress := assertRunEventType(t, runningEvents, "run_progress")
 	if progress.SuccessRequests != 1 || progress.FailedRequests != 0 || progress.TotalRequests != 2 {

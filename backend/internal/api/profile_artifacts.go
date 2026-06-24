@@ -234,11 +234,14 @@ func (store *profileArtifactStore) save(artifact profileArtifactRecord, payload 
 	}
 	defer db.Close()
 
+	if strings.TrimSpace(artifact.ID) == "" {
+		artifact.ID = fmt.Sprintf("profile-%d", time.Now().UTC().UnixNano())
+	}
 	if len(payload) > 0 {
 		if artifact.FileName == "" {
 			artifact.FileName = fmt.Sprintf("%s-%s.pprof", artifact.RunID, artifact.ProfileType)
 		}
-		artifact.StoragePath = filepath.Join(filepath.Dir(store.path), "profile_artifacts", artifact.FileName)
+		artifact.StoragePath = filepath.Join(filepath.Dir(store.path), "profile_artifacts", artifact.ID, filepath.Base(artifact.FileName))
 		if err := os.MkdirAll(filepath.Dir(artifact.StoragePath), 0o755); err != nil {
 			return profileArtifactRecord{}, err
 		}
@@ -338,6 +341,60 @@ func (store *profileArtifactStore) listByRun(runID string) ([]profileArtifactRec
 		ORDER BY started_at DESC
 		LIMIT 100
 	`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	artifacts := []profileArtifactRecord{}
+	for rows.Next() {
+		artifact, err := scanProfileArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return artifacts, nil
+}
+
+func (store *profileArtifactStore) listByRunIDs(runIDs []string) ([]profileArtifactRecord, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	normalizedRunIDs := make([]string, 0, len(runIDs))
+	for _, runID := range runIDs {
+		runID = strings.TrimSpace(runID)
+		if runID != "" {
+			normalizedRunIDs = append(normalizedRunIDs, runID)
+		}
+	}
+	if len(normalizedRunIDs) == 0 {
+		return nil, nil
+	}
+
+	db, err := store.open()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	placeholders := make([]string, len(normalizedRunIDs))
+	args := make([]any, len(normalizedRunIDs))
+	for index, runID := range normalizedRunIDs {
+		placeholders[index] = "?"
+		args[index] = runID
+	}
+	rows, err := db.Query(`
+		SELECT id, run_id, scenario_id, scenario_name, target_id, target_name,
+			profile_type, status, source_url, file_name, content_type, size_bytes,
+			error, started_at, finished_at, storage_path
+		FROM profile_artifacts
+		WHERE run_id IN (`+strings.Join(placeholders, ", ")+`)
+		ORDER BY started_at DESC
+	`, args...)
 	if err != nil {
 		return nil, err
 	}

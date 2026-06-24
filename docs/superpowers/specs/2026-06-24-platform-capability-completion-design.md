@@ -79,6 +79,48 @@ New code should follow existing package boundaries:
 - `backend/internal/api`: expose package downloads, WebSocket control, trend reports, archive downloads, retention cleanup, and threshold action persistence.
 - `frontend/src/app/App.tsx`: add console surfaces using the existing compact operational UI style.
 
+## Profile Task Execution Safety
+
+Profile Tasks are executable work delivered to Agents, so workspace safety cannot depend only on optional REST request scope. The following invariants apply to every Profile Task creation and execution path, including unscoped local-prototype API calls, internal store calls, automatically scheduled tasks, and historical rows already persisted in SQLite.
+
+### Resource Consistency Invariants
+
+`profileTaskStore.create` must validate all referenced resources before inserting a row:
+
+- `agentId` must reference an existing Agent.
+- Non-`target_manual` tasks must include a `runId`, and that Run must exist.
+- `target_manual` tasks may omit `runId`, but must include `targetId`, and that Target must exist.
+- When `targetId` is present, the Target must be in the same workspace as the Agent and any Run.
+- For `target_manual`, the Agent must be currently bound to the Target's `agentIds`; otherwise a caller could dispatch arbitrary work to an unrelated Agent in the same workspace.
+- If `runId`, `agentId`, and `targetId` are all present, all referenced resources must normalize to the same `projectId` and `environment`.
+- Missing referenced resources or mismatched resource scopes reject creation with a `400` API response and no database insert.
+
+These checks run even when the request has no `X-AIT-Project-ID`, `X-AIT-Environment`, or query scope. Header/query workspace scope remains an access-control filter, not the source of truth for task executability.
+
+### Agent Lease And Complete Defenses
+
+Agent polling must never return an invalid persisted task. `leasePending(agentId, limit)` must re-check each candidate task against the same resource consistency rules before leasing it. Tasks that fail this defensive check are not returned to the Agent. The implementation may mark those rows `failed` with an explanatory error so they do not remain in the pending queue forever.
+
+Task completion is also defensive. Before accepting `/agent/v1/profile-tasks/{id}/complete`, the backend must verify that the task's Agent, Run, and Target references still resolve to one workspace. A mismatched historical task cannot be completed successfully, even if the caller presents a valid token for the task's `agentId`.
+
+### Target Manual Task Semantics
+
+The Targets page manually creates profile tasks from a saved Target row. This is not tied to a load-test Run and should remain a Target-scoped operation:
+
+```json
+{
+  "agentId": "agent-checkout-01",
+  "targetId": "target-checkout",
+  "targetName": "checkout-service",
+  "source": "target_manual",
+  "pprofBaseUrl": "http://127.0.0.1:6060/debug/pprof",
+  "profileType": "cpu",
+  "profileSeconds": 30
+}
+```
+
+For `target_manual`, `runId` is optional and normally absent. The backend validates Target-Agent binding and workspace consistency instead of requiring a synthetic Run. Frontend code should keep sending the current Target-scoped payload and should not invent a fake `runId`.
+
 ## Agent Deb/RPM Packages
 
 ### Package Outputs
@@ -441,6 +483,7 @@ Every new REST endpoint and WebSocket endpoint must enforce workspace scope cons
 - Query scope for download, archive, EventSource, and WebSocket links.
 - Cross-scope single-resource access returns `403`.
 - Unscoped requests preserve local prototype compatibility except for sensitive retention cleanup, which requires explicit workspace scope.
+- Unscoped compatibility never bypasses executable-resource invariants. Profile Task create, lease, and complete paths always validate referenced Agent, Run, and Target workspace consistency.
 
 Package downloads remain unscoped because Agent install artifacts are release assets, not workspace data.
 
@@ -501,6 +544,9 @@ Backend tests:
 - Retention cleanup delete mode deletes only scoped workspace files and updates metadata.
 - Threshold actions create expected Profile Tasks for breached Agents, stop active runs during real-time evaluation, skip `stop_run` during final sweeps, apply dedupe/cooldown semantics, and append `threshold_action` events with `metadataJson`.
 - Workspace scope rejects cross-scope archive, cleanup, WebSocket, and trend access.
+- Profile Task creation rejects cross-workspace Run/Agent/Target combinations even without workspace headers.
+- Agent polling does not lease persisted cross-workspace Profile Tasks, and completion rejects such tasks defensively.
+- Targets page `target_manual` Profile Tasks can be created with `agentId + targetId` and no `runId` when the Agent is bound to the Target.
 
 Frontend tests:
 

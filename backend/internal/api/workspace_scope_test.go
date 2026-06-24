@@ -372,6 +372,7 @@ func TestWorkspaceScopeHeadersConstrainRunCreation(t *testing.T) {
 
 	checkoutScenarioID := createWorkspaceScenarioWithBaseURL(t, router, "checkout-scenario", "project-checkout", "staging", upstream.URL)
 	billingScenarioID := createWorkspaceScenarioWithBaseURL(t, router, "billing-scenario", "project-billing", "prod", upstream.URL)
+	checkoutTargetID := createWorkspaceTargetWithBaseURL(t, router, "checkout-target", "project-checkout", "staging", upstream.URL)
 	billingTargetID := createWorkspaceTargetWithBaseURL(t, router, "billing-target", "project-billing", "prod", upstream.URL)
 
 	for _, testCase := range []struct {
@@ -382,6 +383,16 @@ func TestWorkspaceScopeHeadersConstrainRunCreation(t *testing.T) {
 			name: "billing scenario",
 			body: `{
 				"scenarioId": "` + billingScenarioID + `",
+				"totalRequests": 1,
+				"concurrency": 1,
+				"timeoutMs": 50
+			}`,
+		},
+		{
+			name: "billing scenario with checkout target",
+			body: `{
+				"scenarioId": "` + billingScenarioID + `",
+				"targetId": "` + checkoutTargetID + `",
 				"totalRequests": 1,
 				"concurrency": 1,
 				"timeoutMs": 50
@@ -428,6 +439,39 @@ func TestWorkspaceScopeHeadersConstrainRunCreation(t *testing.T) {
 	}
 	if run.ProjectID != "project-checkout" || run.Environment != "staging" {
 		t.Fatalf("expected ad-hoc run scope from headers, got %#v", run)
+	}
+}
+
+func TestWorkspaceScopeRejectsTargetBindingCrossScopeAgent(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	agentStore := newAgentStoreFromEnv()
+	checkoutAgent := upsertWorkspaceAgentRecord(t, agentStore, "agent-target-checkout", "project-checkout", "staging")
+	billingAgent := upsertWorkspaceAgentRecord(t, agentStore, "agent-target-billing", "project-billing", "prod")
+	router := NewRouter()
+
+	createResponse := httptest.NewRecorder()
+	router.ServeHTTP(createResponse, newWorkspaceScopedAPIRequest(http.MethodPost, "/api/targets", `{
+		"name": "checkout-target-cross-agent",
+		"projectId": "project-checkout",
+		"environment": "staging",
+		"baseUrl": "http://checkout.internal:8080",
+		"agentIds": ["`+billingAgent.ID+`"]
+	}`, "project-checkout", "staging"))
+	if createResponse.Code != http.StatusBadRequest {
+		t.Fatalf("expected cross-scope target agent binding status %d, got %d with body %s", http.StatusBadRequest, createResponse.Code, createResponse.Body.String())
+	}
+
+	targetID := createWorkspaceTargetWithBaseURL(t, router, "checkout-target-own-agent", "project-checkout", "staging", "http://checkout.internal:8080")
+	updateResponse := httptest.NewRecorder()
+	router.ServeHTTP(updateResponse, newWorkspaceScopedAPIRequest(http.MethodPut, "/api/targets/"+targetID, `{
+		"name": "checkout-target-own-agent",
+		"projectId": "project-checkout",
+		"environment": "staging",
+		"baseUrl": "http://checkout.internal:8080",
+		"agentIds": ["`+checkoutAgent.ID+`", "`+billingAgent.ID+`"]
+	}`, "project-checkout", "staging"))
+	if updateResponse.Code != http.StatusBadRequest {
+		t.Fatalf("expected cross-scope target agent update status %d, got %d with body %s", http.StatusBadRequest, updateResponse.Code, updateResponse.Body.String())
 	}
 }
 
@@ -535,6 +579,9 @@ func TestWorkspaceScopeHeadersFilterProfileTaskEndpoints(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
 	runStore := newRunHistoryStoreFromEnv()
 	taskStore := newProfileTaskStoreFromEnv()
+	agentStore := newAgentStoreFromEnv()
+	checkoutAgent := upsertWorkspaceAgentRecord(t, agentStore, "agent-profile-task-checkout", "project-checkout", "staging")
+	billingAgent := upsertWorkspaceAgentRecord(t, agentStore, "agent-profile-task-billing", "project-billing", "prod")
 
 	checkoutRun := createRunResponse{
 		ID:            "profile-task-run-checkout",
@@ -567,11 +614,15 @@ func TestWorkspaceScopeHeadersFilterProfileTaskEndpoints(t *testing.T) {
 		t.Fatalf("expected billing run save to succeed, got %v", err)
 	}
 
-	checkoutTask := createWorkspaceProfileTask(t, taskStore, checkoutRun.ID, "agent-checkout")
-	billingTask := createWorkspaceProfileTask(t, taskStore, billingRun.ID, "agent-billing")
+	checkoutTask := createWorkspaceProfileTask(t, taskStore, checkoutRun.ID, checkoutAgent.ID)
+	crossAgentTask := insertWorkspaceProfileTaskFixture(t, taskStore, checkoutRun.ID, billingAgent.ID)
+	billingTask := createWorkspaceProfileTask(t, taskStore, billingRun.ID, billingAgent.ID)
 	failedBillingTask, found, err := taskStore.complete(billingTask.ID, completeProfileTaskRequest{Error: "profile failed"})
 	if err != nil || !found {
 		t.Fatalf("expected billing profile task failure to persist, found=%v err=%v", found, err)
+	}
+	if crossAgentTask.ID == "" {
+		t.Fatal("expected cross-agent fixture task to have id")
 	}
 	if failedBillingTask.Status != "failed" {
 		t.Fatalf("expected billing profile task to be failed, got %#v", failedBillingTask)
@@ -591,8 +642,12 @@ func TestWorkspaceScopeHeadersFilterProfileTaskEndpoints(t *testing.T) {
 	if err := json.NewDecoder(listResponse.Body).Decode(&tasks); err != nil {
 		t.Fatalf("expected profile task list JSON, got decode error: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != checkoutTask.ID || tasks[0].RunID != checkoutRun.ID {
-		t.Fatalf("expected only checkout profile task in scoped list, got %#v", tasks)
+	taskByID := map[string]string{}
+	for _, task := range tasks {
+		taskByID[task.ID] = task.RunID
+	}
+	if len(taskByID) != 1 || taskByID[checkoutTask.ID] != checkoutRun.ID {
+		t.Fatalf("expected only same-scope profile tasks in scoped list, got %#v", tasks)
 	}
 
 	crossRunListResponse := httptest.NewRecorder()
@@ -610,14 +665,26 @@ func TestWorkspaceScopeHeadersFilterProfileTaskEndpoints(t *testing.T) {
 
 	createResponse := httptest.NewRecorder()
 	router.ServeHTTP(createResponse, newWorkspaceScopedAPIRequest(http.MethodPost, "/api/profile-tasks", `{
-		"agentId": "agent-billing",
-		"runId": "`+billingRun.ID+`",
+		"agentId": "`+billingAgent.ID+`",
+		"runId": "`+checkoutRun.ID+`",
 		"pprofBaseUrl": "http://billing.internal:6060/debug/pprof",
 		"profileType": "cpu",
 		"profileSeconds": 1
 	}`, "project-checkout", "staging"))
 	if createResponse.Code != http.StatusForbidden {
-		t.Fatalf("expected cross-scope profile task creation status %d, got %d with body %s", http.StatusForbidden, createResponse.Code, createResponse.Body.String())
+		t.Fatalf("expected cross-agent profile task creation status %d, got %d with body %s", http.StatusForbidden, createResponse.Code, createResponse.Body.String())
+	}
+
+	crossRunCreateResponse := httptest.NewRecorder()
+	router.ServeHTTP(crossRunCreateResponse, newWorkspaceScopedAPIRequest(http.MethodPost, "/api/profile-tasks", `{
+		"agentId": "`+billingAgent.ID+`",
+		"runId": "`+billingRun.ID+`",
+		"pprofBaseUrl": "http://billing.internal:6060/debug/pprof",
+		"profileType": "cpu",
+		"profileSeconds": 1
+	}`, "project-checkout", "staging"))
+	if crossRunCreateResponse.Code != http.StatusForbidden {
+		t.Fatalf("expected cross-run profile task creation status %d, got %d with body %s", http.StatusForbidden, crossRunCreateResponse.Code, crossRunCreateResponse.Body.String())
 	}
 
 	retryResponse := httptest.NewRecorder()
@@ -858,6 +925,44 @@ func createWorkspaceProfileTask(t *testing.T, store *profileTaskStore, runID str
 	})
 	if err != nil {
 		t.Fatalf("expected profile task creation to succeed, got %v", err)
+	}
+	return task
+}
+
+func insertWorkspaceProfileTaskFixture(t *testing.T, store *profileTaskStore, runID string, agentID string) profileTaskRecord {
+	t.Helper()
+	db, err := store.open()
+	if err != nil {
+		t.Fatalf("expected profile task fixture DB open to succeed, got %v", err)
+	}
+	defer db.Close()
+
+	now := "2026-06-12T09:02:00Z"
+	task := profileTaskRecord{
+		ID:             newResourceID("profile-task"),
+		AgentID:        agentID,
+		RunID:          runID,
+		PprofBaseURL:   "http://" + agentID + ".internal:6060/debug/pprof",
+		ProfileType:    "cpu",
+		ProfileSeconds: 1,
+		Source:         defaultProfileTaskSource,
+		Status:         "pending",
+		MaxAttempts:    1,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = db.Exec(`
+		INSERT INTO profile_tasks (
+			id, agent_id, run_id, scenario_id, scenario_name, target_id, target_name,
+			pprof_base_url, profile_url, profile_type, profile_seconds,
+			profile_command, profile_command_args, profile_command_output, profile_command_timeout_ms,
+			source, status, attempts, max_attempts,
+			artifact_id, error, created_at, updated_at, leased_at, completed_at
+		) VALUES (?, ?, ?, '', '', '', '', ?, '', ?, ?, '', '[]', '', 0, ?, ?, 0, ?, '', '', ?, ?, '', '')
+	`, task.ID, task.AgentID, task.RunID, task.PprofBaseURL, task.ProfileType, task.ProfileSeconds,
+		task.Source, task.Status, task.MaxAttempts, task.CreatedAt, task.UpdatedAt)
+	if err != nil {
+		t.Fatalf("expected profile task fixture insert to succeed, got %v", err)
 	}
 	return task
 }

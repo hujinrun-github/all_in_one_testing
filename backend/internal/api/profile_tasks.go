@@ -219,6 +219,10 @@ func handleCompleteProfileTask(agentStore *agentStore, taskStore *profileTaskSto
 			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
+		if err := taskStore.requireProfileTaskResourceConsistency(existing); err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 
 		task, found, err := taskStore.complete(taskID, input)
 		if err != nil {
@@ -275,6 +279,9 @@ func (store *profileTaskStore) create(input profileTaskRecord) (profileTaskRecor
 
 	task := normalizeProfileTask(input)
 	if err := validateProfileTask(task); err != nil {
+		return profileTaskRecord{}, err
+	}
+	if err := validateProfileTaskResourceConsistency(db, task); err != nil {
 		return profileTaskRecord{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -382,34 +389,32 @@ func (store *profileTaskStore) list(filter profileTaskListFilter) ([]profileTask
 }
 
 func profileTaskScopeCondition(filter profileTaskListFilter) (string, []any) {
-	runConditions := []string{"scoped_runs.id = profile_tasks.run_id"}
-	agentConditions := []string{"scoped_agents.id = profile_tasks.agent_id"}
+	conditions := []string{}
 	args := []any{}
-	if filter.ProjectID != "" {
-		runConditions = append(runConditions, "scoped_runs.project_id = ?")
-		args = append(args, filter.ProjectID)
-	}
-	if filter.Environment != "" {
-		runConditions = append(runConditions, "scoped_runs.environment = ?")
-		args = append(args, filter.Environment)
-	}
-	if filter.ProjectID != "" {
-		agentConditions = append(agentConditions, "scoped_agents.project_id = ?")
-		args = append(args, filter.ProjectID)
-	}
-	if filter.Environment != "" {
-		agentConditions = append(agentConditions, "scoped_agents.environment = ?")
-		args = append(args, filter.Environment)
-	}
+	conditions = append(conditions, "(profile_tasks.run_id <> '' OR profile_tasks.agent_id <> '' OR profile_tasks.target_id <> '')")
+	conditions = append(conditions, `(profile_tasks.run_id = '' OR EXISTS (
+			SELECT 1 FROM run_history scoped_runs WHERE `+profileTaskScopedResourceConditions("scoped_runs", "profile_tasks.run_id", filter, &args)+`
+		))`)
+	conditions = append(conditions, `(profile_tasks.agent_id = '' OR EXISTS (
+			SELECT 1 FROM agents scoped_agents WHERE `+profileTaskScopedResourceConditions("scoped_agents", "profile_tasks.agent_id", filter, &args)+`
+		))`)
+	conditions = append(conditions, `(profile_tasks.target_id = '' OR EXISTS (
+			SELECT 1 FROM targets scoped_targets WHERE `+profileTaskScopedResourceConditions("scoped_targets", "profile_tasks.target_id", filter, &args)+`
+		))`)
+	return "(" + strings.Join(conditions, " AND ") + ")", args
+}
 
-	return `(
-		(profile_tasks.run_id <> '' AND EXISTS (
-			SELECT 1 FROM run_history scoped_runs WHERE ` + strings.Join(runConditions, " AND ") + `
-		))
-		OR (profile_tasks.run_id = '' AND profile_tasks.agent_id <> '' AND EXISTS (
-			SELECT 1 FROM agents scoped_agents WHERE ` + strings.Join(agentConditions, " AND ") + `
-		))
-	)`, args
+func profileTaskScopedResourceConditions(tableAlias string, idExpression string, filter profileTaskListFilter, args *[]any) string {
+	conditions := []string{tableAlias + ".id = " + idExpression}
+	if filter.ProjectID != "" {
+		conditions = append(conditions, tableAlias+".project_id = ?")
+		*args = append(*args, filter.ProjectID)
+	}
+	if filter.Environment != "" {
+		conditions = append(conditions, tableAlias+".environment = ?")
+		*args = append(*args, filter.Environment)
+	}
+	return strings.Join(conditions, " AND ")
 }
 
 func (store *profileTaskStore) leasePending(agentID string, limit int) ([]profileTaskRecord, error) {
@@ -467,6 +472,17 @@ func (store *profileTaskStore) leasePending(agentID string, limit int) ([]profil
 	}
 
 	now := nowTime.Format(time.RFC3339Nano)
+	validTasks := make([]profileTaskRecord, 0, len(tasks))
+	for _, task := range tasks {
+		if err := validateProfileTaskResourceConsistency(db, task); err != nil {
+			if updateErr := failInvalidProfileTaskCandidate(db, task, err, now); updateErr != nil {
+				return nil, updateErr
+			}
+			continue
+		}
+		validTasks = append(validTasks, task)
+	}
+	tasks = validTasks
 	for index := range tasks {
 		tasks[index].Status = "leased"
 		tasks[index].LeasedAt = now
@@ -481,6 +497,15 @@ func (store *profileTaskStore) leasePending(agentID string, limit int) ([]profil
 		}
 	}
 	return tasks, nil
+}
+
+func failInvalidProfileTaskCandidate(db *sql.DB, task profileTaskRecord, err error, now string) error {
+	_, updateErr := db.Exec(`
+		UPDATE profile_tasks
+		SET status = 'failed', error = ?, updated_at = ?, completed_at = ?
+		WHERE id = ? AND status IN ('pending', 'leased')
+	`, err.Error(), now, now, task.ID)
+	return updateErr
 }
 
 func profileTaskLeaseTimeoutFromEnv() time.Duration {
@@ -565,6 +590,9 @@ func (store *profileTaskStore) complete(id string, input completeProfileTaskRequ
 	existing, found, err := getProfileTaskByID(db, id)
 	if err != nil || !found {
 		return profileTaskRecord{}, found, err
+	}
+	if err := validateProfileTaskResourceConsistency(db, existing); err != nil {
+		return profileTaskRecord{}, true, err
 	}
 	input.ArtifactID = strings.TrimSpace(input.ArtifactID)
 	input.Error = strings.TrimSpace(input.Error)
@@ -667,42 +695,81 @@ func (store *profileTaskStore) get(id string) (profileTaskRecord, bool, error) {
 	return getProfileTaskByID(db, id)
 }
 
+func (store *profileTaskStore) requireProfileTaskResourceConsistency(task profileTaskRecord) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	db, err := store.open()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return validateProfileTaskResourceConsistency(db, task)
+}
+
 func (store *profileTaskStore) requireWorkspaceScopeForTask(r *http.Request, task profileTaskRecord) (int, error) {
 	scope, ok := workspaceScopeFromRequest(r)
 	if !ok {
 		return 0, nil
 	}
 
-	projectID, environment, found, err := store.lookupTaskWorkspaceScope(task)
+	scopes, err := store.lookupTaskWorkspaceScopes(task)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	if !found {
+	if len(scopes) == 0 {
 		return http.StatusForbidden, workspaceScopeError("", "", scope)
 	}
-	if err := requireWorkspaceScopeForRecord(r, projectID, environment); err != nil {
-		return http.StatusForbidden, err
+	for _, resourceScope := range scopes {
+		if resourceScope.ProjectID != scope.ProjectID || resourceScope.Environment != scope.Environment {
+			return http.StatusForbidden, workspaceScopeError(resourceScope.ProjectID, resourceScope.Environment, scope)
+		}
 	}
 	return 0, nil
 }
 
-func (store *profileTaskStore) lookupTaskWorkspaceScope(task profileTaskRecord) (string, string, bool, error) {
+func (store *profileTaskStore) lookupTaskWorkspaceScopes(task profileTaskRecord) ([]workspaceScopeConstraint, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
 	db, err := store.open()
 	if err != nil {
-		return "", "", false, err
+		return nil, err
 	}
 	defer db.Close()
 
+	scopes := []workspaceScopeConstraint{}
 	if task.RunID != "" {
-		return lookupRunWorkspaceScope(db, task.RunID)
+		projectID, environment, found, err := lookupRunWorkspaceScope(db, task.RunID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, nil
+		}
+		scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
 	}
 	if task.AgentID != "" {
-		return lookupAgentWorkspaceScope(db, task.AgentID)
+		projectID, environment, found, err := lookupAgentWorkspaceScope(db, task.AgentID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, nil
+		}
+		scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
 	}
-	return "", "", false, nil
+	if task.TargetID != "" {
+		projectID, environment, found, err := lookupTargetWorkspaceScope(db, task.TargetID)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, nil
+		}
+		scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
+	}
+	return scopes, nil
 }
 
 func lookupRunWorkspaceScope(db *sql.DB, runID string) (string, string, bool, error) {
@@ -739,6 +806,88 @@ func lookupAgentWorkspaceScope(db *sql.DB, agentID string) (string, string, bool
 	return projectID, environment, true, nil
 }
 
+func lookupTargetWorkspaceScope(db *sql.DB, targetID string) (string, string, bool, error) {
+	var projectID string
+	var environment string
+	err := db.QueryRow(`
+		SELECT project_id, environment
+		FROM targets
+		WHERE id = ?
+	`, strings.TrimSpace(targetID)).Scan(&projectID, &environment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return projectID, environment, true, nil
+}
+
+func validateProfileTaskResourceConsistency(db *sql.DB, task profileTaskRecord) error {
+	scopes := []workspaceScopeConstraint{}
+
+	projectID, environment, found, err := lookupAgentWorkspaceScope(db, task.AgentID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("workspace agent %q not found", task.AgentID)
+	}
+	scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
+
+	if task.RunID != "" {
+		projectID, environment, found, err = lookupRunWorkspaceScope(db, task.RunID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("workspace run %q not found", task.RunID)
+		}
+		scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
+	}
+
+	var target targetRecord
+	if task.TargetID != "" {
+		projectID, environment, found, err = lookupTargetWorkspaceScope(db, task.TargetID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("workspace target %q not found", task.TargetID)
+		}
+		scopes = append(scopes, normalizedWorkspaceScope(projectID, environment))
+
+		target, found, err = getTargetByID(db, task.TargetID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("workspace target %q not found", task.TargetID)
+		}
+	}
+
+	baseScope := scopes[0]
+	for _, scope := range scopes[1:] {
+		if scope.ProjectID != baseScope.ProjectID || scope.Environment != baseScope.Environment {
+			return workspaceScopeError(scope.ProjectID, scope.Environment, baseScope)
+		}
+	}
+	if task.Source == targetManualProfileTaskSource && !targetHasAgent(target, task.AgentID) {
+		return fmt.Errorf("agent %q is not assigned to target %q for target_manual profile task", task.AgentID, task.TargetID)
+	}
+	return nil
+}
+
+func targetHasAgent(target targetRecord, agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	for _, targetAgentID := range target.AgentIDs {
+		if strings.TrimSpace(targetAgentID) == agentID {
+			return true
+		}
+	}
+	return false
+}
+
 func (store *profileTaskStore) open() (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(store.path), 0o755); err != nil {
 		return nil, err
@@ -761,6 +910,10 @@ func (store *profileTaskStore) open() (*sql.DB, error) {
 		return nil, err
 	}
 	if err := ensureAgentSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureTargetSchema(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -923,7 +1076,11 @@ func validateProfileTask(input profileTaskRecord) error {
 	if input.AgentID == "" {
 		return fmt.Errorf("agentId is required")
 	}
-	if input.RunID == "" {
+	if input.Source == targetManualProfileTaskSource {
+		if input.TargetID == "" {
+			return fmt.Errorf("targetId is required for target_manual profile task")
+		}
+	} else if input.RunID == "" {
 		return fmt.Errorf("runId is required")
 	}
 	if input.PprofBaseURL == "" && input.ProfileURL == "" && input.ProfileCommand == "" {

@@ -258,7 +258,7 @@ func handleGetProfileArtifactComparisonReport(runStore *runHistoryStore, artifac
 			return
 		}
 
-		artifacts, err := artifactStore.list()
+		artifacts, err := artifactStore.listByRunIDs(runIDsFromResponses(runs))
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -363,6 +363,17 @@ func splitRunIDs(raw string) []string {
 	runIDs := make([]string, 0, len(parts))
 	for _, part := range parts {
 		runID := strings.TrimSpace(part)
+		if runID != "" {
+			runIDs = append(runIDs, runID)
+		}
+	}
+	return runIDs
+}
+
+func runIDsFromResponses(runs []createRunResponse) []string {
+	runIDs := make([]string, 0, len(runs))
+	for _, run := range runs {
+		runID := strings.TrimSpace(run.ID)
 		if runID != "" {
 			runIDs = append(runIDs, runID)
 		}
