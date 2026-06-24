@@ -12,8 +12,72 @@ import (
 	"time"
 )
 
+func saveProfileTaskRunFixture(t *testing.T, runID string, projectID string, environment string) {
+	t.Helper()
+	store := newRunHistoryStoreFromEnv()
+	if err := store.save(createRunResponse{
+		ID:            runID,
+		Name:          runID,
+		ProjectID:     projectID,
+		Environment:   environment,
+		Status:        "finished",
+		Protocol:      "HTTP",
+		Method:        http.MethodGet,
+		URL:           "http://checkout.internal/ready",
+		TotalRequests: 1,
+		CreatedAt:     "2026-06-24T09:00:00Z",
+	}); err != nil {
+		t.Fatalf("expected run fixture %s save to succeed, got %v", runID, err)
+	}
+}
+
+func insertUnsafeProfileTaskFixture(t *testing.T, task profileTaskRecord) {
+	t.Helper()
+	db, err := newProfileTaskStoreFromEnv().open()
+	if err != nil {
+		t.Fatalf("expected profile task DB open to succeed, got %v", err)
+	}
+	defer db.Close()
+	now := "2026-06-24T09:05:00Z"
+	if task.ID == "" {
+		task.ID = newResourceID("profile-task")
+	}
+	if task.ProfileType == "" {
+		task.ProfileType = "cpu"
+	}
+	if task.ProfileSeconds == 0 {
+		task.ProfileSeconds = 1
+	}
+	if task.Source == "" {
+		task.Source = defaultProfileTaskSource
+	}
+	if task.Status == "" {
+		task.Status = "pending"
+	}
+	if task.PprofBaseURL == "" {
+		task.PprofBaseURL = "http://127.0.0.1:6060/debug/pprof"
+	}
+	if task.MaxAttempts == 0 {
+		task.MaxAttempts = defaultProfileTaskMaxAttempts
+	}
+	if _, err := db.Exec(`
+		INSERT INTO profile_tasks (
+			id, agent_id, run_id, scenario_id, scenario_name, target_id, target_name,
+			pprof_base_url, profile_url, profile_type, profile_seconds,
+			profile_command, profile_command_args, profile_command_output, profile_command_timeout_ms,
+			source, status, attempts, max_attempts,
+			artifact_id, error, created_at, updated_at, leased_at, completed_at
+		) VALUES (?, ?, ?, '', '', ?, ?, ?, '', ?, ?, '', '[]', '', 0, ?, ?, 0, ?, '', '', ?, ?, ?, '')
+	`, task.ID, task.AgentID, task.RunID, task.TargetID, task.TargetName,
+		task.PprofBaseURL, task.ProfileType, task.ProfileSeconds,
+		task.Source, task.Status, task.MaxAttempts, now, now, task.LeasedAt); err != nil {
+		t.Fatalf("expected unsafe profile task fixture insert to succeed, got %v", err)
+	}
+}
+
 func TestProfileTaskLifecycleCreatesLeasesAndCompletesTask(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-profile-task-1", "default", "default")
 	router := NewRouter()
 	token := createAgentToken(t, router)
 
@@ -139,6 +203,7 @@ func TestProfileTaskLifecycleCreatesLeasesAndCompletesTask(t *testing.T) {
 
 func TestAgentTokenCannotPollOrCompleteProfileTasksForAnotherAgent(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-billing-profile-secure", "project-billing", "prod")
 	router := NewRouter()
 
 	checkoutToken := createScopedAgentToken(t, router, "checkout-install", "project-checkout", "staging")
@@ -233,6 +298,146 @@ func TestCreateProfileTaskRejectsInvalidProfileSeconds(t *testing.T) {
 	}
 }
 
+func TestProfileTaskStoreRejectsCrossScopeRunAndAgent(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-checkout-profile-scope", "project-checkout", "staging")
+	agentStore := newAgentStoreFromEnv()
+	billingAgent := upsertWorkspaceAgentRecord(t, agentStore, "agent-billing-profile-scope", "project-billing", "prod")
+
+	_, err := newProfileTaskStoreFromEnv().create(profileTaskRecord{
+		AgentID:        billingAgent.ID,
+		RunID:          "run-checkout-profile-scope",
+		PprofBaseURL:   "http://127.0.0.1:6060/debug/pprof",
+		ProfileType:    "cpu",
+		ProfileSeconds: 1,
+	})
+	if err == nil {
+		t.Fatal("expected cross-scope profile task creation to fail")
+	}
+	if !strings.Contains(err.Error(), "workspace") {
+		t.Fatalf("expected workspace mismatch error, got %v", err)
+	}
+}
+
+func TestAgentPollRejectsPersistedCrossScopeRunTaskForSameAgent(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	router := NewRouter()
+	saveProfileTaskRunFixture(t, "run-checkout-historical-task", "project-checkout", "staging")
+	billingToken := createScopedAgentToken(t, router, "billing-historical-token", "project-billing", "prod")
+	billingAgentID := registerScopedAgentWithID(t, router, billingToken.Token, "agent-billing-historical-01", "billing-historical-01")
+	insertUnsafeProfileTaskFixture(t, profileTaskRecord{
+		ID:             "profile-task-cross-scope-historical",
+		AgentID:        billingAgentID,
+		RunID:          "run-checkout-historical-task",
+		PprofBaseURL:   "http://127.0.0.1:6060/debug/pprof",
+		ProfileType:    "cpu",
+		ProfileSeconds: 1,
+		Source:         defaultProfileTaskSource,
+		Status:         "pending",
+	})
+
+	poll := httptest.NewRecorder()
+	router.ServeHTTP(poll, newAuthorizedAgentRequest(http.MethodGet, "/agent/v1/profile-tasks?agentId="+billingAgentID, billingToken.Token, ""))
+	if poll.Code != http.StatusOK {
+		t.Fatalf("expected poll status %d, got %d with body %s", http.StatusOK, poll.Code, poll.Body.String())
+	}
+	var tasks []profileTaskRecord
+	if err := json.NewDecoder(poll.Body).Decode(&tasks); err != nil {
+		t.Fatalf("expected poll JSON, got decode error: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("expected cross-scope historical task not to be leased, got %#v", tasks)
+	}
+	stored, found, err := newProfileTaskStoreFromEnv().get("profile-task-cross-scope-historical")
+	if err != nil || !found {
+		t.Fatalf("expected historical task lookup, found=%v err=%v", found, err)
+	}
+	if stored.Status != "failed" || !strings.Contains(stored.Error, "workspace") {
+		t.Fatalf("expected invalid historical task to be failed with workspace error, got %#v", stored)
+	}
+}
+
+func TestAgentCannotCompletePersistedCrossScopeRunTask(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	router := NewRouter()
+	saveProfileTaskRunFixture(t, "run-checkout-complete-task", "project-checkout", "staging")
+	billingToken := createScopedAgentToken(t, router, "billing-complete-token", "project-billing", "prod")
+	billingAgentID := registerScopedAgentWithID(t, router, billingToken.Token, "agent-billing-complete-01", "billing-complete-01")
+	insertUnsafeProfileTaskFixture(t, profileTaskRecord{
+		ID:             "profile-task-cross-scope-complete",
+		AgentID:        billingAgentID,
+		RunID:          "run-checkout-complete-task",
+		PprofBaseURL:   "http://127.0.0.1:6060/debug/pprof",
+		ProfileType:    "cpu",
+		ProfileSeconds: 1,
+		Source:         defaultProfileTaskSource,
+		Status:         "leased",
+		LeasedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	})
+
+	complete := httptest.NewRecorder()
+	router.ServeHTTP(complete, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/profile-tasks/profile-task-cross-scope-complete/complete", billingToken.Token, `{
+		"artifactId": "profile-cross-scope-artifact"
+	}`))
+	if complete.Code != http.StatusConflict {
+		t.Fatalf("expected cross-scope complete status %d, got %d with body %s", http.StatusConflict, complete.Code, complete.Body.String())
+	}
+	stored, found, err := newProfileTaskStoreFromEnv().get("profile-task-cross-scope-complete")
+	if err != nil || !found {
+		t.Fatalf("expected task lookup, found=%v err=%v", found, err)
+	}
+	if stored.Status == "completed" || stored.ArtifactID != "" {
+		t.Fatalf("expected invalid task not to complete, got %#v", stored)
+	}
+}
+
+func TestCreateTargetManualProfileTaskWithoutRunID(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	router := NewRouter()
+	token := createScopedAgentToken(t, router, "manual-target-token", "project-checkout", "staging")
+	agentID := registerScopedAgentWithID(t, router, token.Token, "agent-target-manual-01", "target-manual-01")
+
+	createTarget := httptest.NewRecorder()
+	router.ServeHTTP(createTarget, httptest.NewRequest(http.MethodPost, "/api/targets", bytes.NewBufferString(`{
+		"name": "checkout-manual-target",
+		"projectId": "project-checkout",
+		"environment": "staging",
+		"baseUrl": "http://checkout.internal:8080",
+		"agentIds": ["`+agentID+`"],
+		"profileEndpoint": "http://127.0.0.1:6060/debug/pprof"
+	}`)))
+	if createTarget.Code != http.StatusCreated {
+		t.Fatalf("expected target creation status %d, got %d with body %s", http.StatusCreated, createTarget.Code, createTarget.Body.String())
+	}
+	var target struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(createTarget.Body).Decode(&target); err != nil {
+		t.Fatalf("expected target JSON, got decode error: %v", err)
+	}
+
+	createTask := httptest.NewRecorder()
+	router.ServeHTTP(createTask, httptest.NewRequest(http.MethodPost, "/api/profile-tasks", bytes.NewBufferString(`{
+		"agentId": "`+agentID+`",
+		"targetId": "`+target.ID+`",
+		"targetName": "checkout-manual-target",
+		"source": "target_manual",
+		"pprofBaseUrl": "http://127.0.0.1:6060/debug/pprof",
+		"profileType": "cpu",
+		"profileSeconds": 30
+	}`)))
+	if createTask.Code != http.StatusCreated {
+		t.Fatalf("expected target_manual create status %d, got %d with body %s", http.StatusCreated, createTask.Code, createTask.Body.String())
+	}
+	var created profileTaskRecord
+	if err := json.NewDecoder(createTask.Body).Decode(&created); err != nil {
+		t.Fatalf("expected created profile task JSON, got decode error: %v", err)
+	}
+	if created.RunID != "" || created.TargetID != target.ID || created.AgentID != agentID || created.Source != targetManualProfileTaskSource {
+		t.Fatalf("expected target-scoped manual task without run, got %#v", created)
+	}
+}
+
 func TestCreateProfileTaskRejectsInvalidSource(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
 	router := NewRouter()
@@ -257,6 +462,7 @@ func TestCreateProfileTaskRejectsInvalidSource(t *testing.T) {
 
 func TestProfileTaskLifecycleCreatesAndLeasesCommandProfilerTask(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-command-profile-task-1", "default", "default")
 	router := NewRouter()
 	token := createAgentToken(t, router)
 	registerScopedAgentWithID(t, router, token, "agent-checkout-01", "checkout-01")
@@ -330,6 +536,7 @@ func TestProfileTaskLifecycleCreatesAndLeasesCommandProfilerTask(t *testing.T) {
 func TestProfileTaskLeaseExpiresAndCanBeReclaimed(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
 	t.Setenv("PROFILE_TASK_LEASE_TIMEOUT_MS", "1")
+	saveProfileTaskRunFixture(t, "run-profile-task-timeout", "default", "default")
 	router := NewRouter()
 	token := createAgentToken(t, router)
 	registerScopedAgentWithID(t, router, token, "agent-checkout-01", "checkout-01")
@@ -425,12 +632,27 @@ func TestProfileTaskLeaseExpiresAndCanBeReclaimed(t *testing.T) {
 
 func TestListProfileTasksFiltersByRunAgentStatusAndLimit(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-profile-filter-1", "default", "default")
+	saveProfileTaskRunFixture(t, "run-profile-filter-2", "default", "default")
+	agentStore := newAgentStoreFromEnv()
+	upsertWorkspaceAgentRecord(t, agentStore, "agent-checkout-01", "default", "default")
+	upsertWorkspaceAgentRecord(t, agentStore, "agent-checkout-02", "default", "default")
+	manualTarget, err := newTargetStoreFromEnv().create(targetRecord{
+		Name:      "checkout-manual-filter",
+		BaseURL:   "http://checkout.internal:8080",
+		AgentIDs:  []string{"agent-checkout-01"},
+		ProjectID: "default",
+	})
+	if err != nil {
+		t.Fatalf("expected manual target fixture save to succeed, got %v", err)
+	}
 	router := NewRouter()
 
 	for _, body := range []string{
 		`{
 			"agentId": "agent-checkout-01",
 			"runId": "run-profile-filter-1",
+			"targetId": "` + manualTarget.ID + `",
 			"targetName": "checkout-01",
 			"pprofBaseUrl": "http://127.0.0.1:6060/debug/pprof",
 			"profileType": "cpu",
@@ -505,6 +727,7 @@ func TestListProfileTasksFiltersByRunAgentStatusAndLimit(t *testing.T) {
 
 func TestProfileTaskFailureRetriesUntilMaxAttempts(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-profile-task-retry", "default", "default")
 	router := NewRouter()
 	token := createAgentToken(t, router)
 	registerScopedAgentWithID(t, router, token, "agent-checkout-01", "checkout-01")
@@ -626,6 +849,7 @@ func TestProfileTaskFailureRetriesUntilMaxAttempts(t *testing.T) {
 
 func TestRetryFailedProfileTaskRequeuesTask(t *testing.T) {
 	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "platform.db"))
+	saveProfileTaskRunFixture(t, "run-profile-task-requeue", "default", "default")
 	router := NewRouter()
 	token := createAgentToken(t, router)
 	registerScopedAgentWithID(t, router, token, "agent-checkout-01", "checkout-01")

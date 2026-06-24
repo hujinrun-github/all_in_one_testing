@@ -788,10 +788,20 @@ func validateTarget(db *sql.DB, input targetRecord) error {
 		return fmt.Errorf("baseUrl is required")
 	}
 	for _, agentID := range input.AgentIDs {
-		if _, found, err := getAgentByID(db, agentID); err != nil {
+		agent, found, err := getAgentByID(db, agentID)
+		if err != nil {
 			return err
-		} else if !found {
+		}
+		if !found {
 			return fmt.Errorf("agent %q not found", agentID)
+		}
+		if !workspaceScopesMatch(input.ProjectID, input.Environment, agent.ProjectID, agent.Environment) {
+			return fmt.Errorf("agent %q belongs to workspace %s/%s, not target workspace %s/%s",
+				agentID,
+				normalizedWorkspaceScope(agent.ProjectID, agent.Environment).ProjectID,
+				normalizedWorkspaceScope(agent.ProjectID, agent.Environment).Environment,
+				normalizedWorkspaceScope(input.ProjectID, input.Environment).ProjectID,
+				normalizedWorkspaceScope(input.ProjectID, input.Environment).Environment)
 		}
 	}
 	return nil

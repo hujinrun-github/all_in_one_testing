@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -241,9 +242,9 @@ func TestGetRunReportIncludesTargetMetricsWindow(t *testing.T) {
 	setRunTestDatabase(t)
 
 	router := NewRouter()
-	token := createAgentToken(t, router)
+	token := createScopedAgentToken(t, router, "report-window-token", "default", "prod")
 	heartbeat := httptest.NewRecorder()
-	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token, `{
+	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token.Token, `{
 		"id": "agent-report-window-01",
 		"name": "checkout-01",
 		"hostname": "checkout-host-01",
@@ -335,7 +336,7 @@ func TestGetRunReportIncludesTargetMetricsWindow(t *testing.T) {
 		}`,
 	} {
 		response := httptest.NewRecorder()
-		router.ServeHTTP(response, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token, payload))
+		router.ServeHTTP(response, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token.Token, payload))
 		if response.Code != http.StatusAccepted {
 			t.Fatalf("expected metrics status %d, got %d with body %s", http.StatusAccepted, response.Code, response.Body.String())
 		}
@@ -539,9 +540,9 @@ func TestGetRunReportIncludesTargetMetricThresholdAlerts(t *testing.T) {
 	setRunTestDatabase(t)
 
 	router := NewRouter()
-	token := createAgentToken(t, router)
+	token := createScopedAgentToken(t, router, "threshold-alert-token", "default", "prod")
 	heartbeat := httptest.NewRecorder()
-	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token, `{
+	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token.Token, `{
 		"id": "agent-threshold-alert-01",
 		"name": "checkout-threshold-01",
 		"hostname": "checkout-threshold-host-01",
@@ -573,7 +574,7 @@ func TestGetRunReportIncludesTargetMetricThresholdAlerts(t *testing.T) {
 	}
 
 	metrics := httptest.NewRecorder()
-	router.ServeHTTP(metrics, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token, `{
+	router.ServeHTTP(metrics, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token.Token, `{
 		"agentId": "agent-threshold-alert-01",
 		"collectedAt": "2026-06-14T10:01:30Z",
 		"cpuUsagePercent": 72.5,
@@ -668,9 +669,9 @@ func TestGetProcessTrendComparisonReportComparesRecentRunProcessTrends(t *testin
 	setRunTestDatabase(t)
 
 	router := NewRouter()
-	token := createAgentToken(t, router)
+	token := createScopedAgentToken(t, router, "process-compare-token", "default", "prod")
 	heartbeat := httptest.NewRecorder()
-	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token, `{
+	router.ServeHTTP(heartbeat, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/heartbeat", token.Token, `{
 		"id": "agent-process-compare-01",
 		"name": "checkout-compare-01",
 		"hostname": "checkout-host-compare-01",
@@ -817,7 +818,7 @@ func TestGetProcessTrendComparisonReportComparesRecentRunProcessTrends(t *testin
 		}`,
 	} {
 		response := httptest.NewRecorder()
-		router.ServeHTTP(response, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token, payload))
+		router.ServeHTTP(response, newAuthorizedAgentRequest(http.MethodPost, "/agent/v1/metrics", token.Token, payload))
 		if response.Code != http.StatusAccepted {
 			t.Fatalf("expected metrics status %d, got %d with body %s", http.StatusAccepted, response.Code, response.Body.String())
 		}
@@ -1204,6 +1205,113 @@ func TestGetProfileArtifactComparisonReportGroupsArtifactsForLatestRuns(t *testi
 	}
 	if report.Groups[1].LatestStatus != "failed" || report.Groups[1].PreviousStatus != "collected" || !report.Groups[1].StatusChanged {
 		t.Fatalf("expected heap group to show status changed from collected to failed, got %#v", report.Groups[1])
+	}
+}
+
+func TestGetProfileArtifactComparisonReportLoadsArtifactsForExplicitRunIDsBeyondGlobalRecentLimit(t *testing.T) {
+	setRunTestDatabase(t)
+
+	runStore := newRunHistoryStoreFromEnv()
+	targetRuns := []createRunResponse{
+		{
+			ID:              "run-explicit-artifact-old",
+			Name:            "explicit-old",
+			Status:          "finished",
+			Method:          http.MethodGet,
+			URL:             "http://checkout.internal/health",
+			TotalRequests:   10,
+			SuccessRequests: 10,
+			DurationMs:      100,
+			CreatedAt:       "2026-06-16T10:00:00Z",
+		},
+		{
+			ID:              "run-explicit-artifact-new",
+			Name:            "explicit-new",
+			Status:          "finished",
+			Method:          http.MethodGet,
+			URL:             "http://checkout.internal/health",
+			TotalRequests:   10,
+			SuccessRequests: 10,
+			DurationMs:      100,
+			CreatedAt:       "2026-06-16T11:00:00Z",
+		},
+	}
+	for _, run := range targetRuns {
+		if err := runStore.save(run); err != nil {
+			t.Fatalf("failed to save target run %s: %v", run.ID, err)
+		}
+	}
+
+	artifactStore := newProfileArtifactStoreFromEnv()
+	for _, artifact := range []profileArtifactRecord{
+		{
+			ID:          "profile-explicit-old-cpu",
+			RunID:       "run-explicit-artifact-old",
+			ProfileType: "cpu",
+			Status:      "collected",
+			FileName:    "explicit-old-cpu.pprof",
+			SizeBytes:   16,
+			StartedAt:   "2026-06-16T10:00:00Z",
+			FinishedAt:  "2026-06-16T10:00:01Z",
+		},
+		{
+			ID:          "profile-explicit-new-cpu",
+			RunID:       "run-explicit-artifact-new",
+			ProfileType: "cpu",
+			Status:      "collected",
+			FileName:    "explicit-new-cpu.pprof",
+			SizeBytes:   32,
+			StartedAt:   "2026-06-16T11:00:00Z",
+			FinishedAt:  "2026-06-16T11:00:01Z",
+		},
+	} {
+		if _, err := artifactStore.save(artifact, nil); err != nil {
+			t.Fatalf("failed to save explicit artifact %s: %v", artifact.ID, err)
+		}
+	}
+	for index := 0; index < 101; index++ {
+		artifact := profileArtifactRecord{
+			ID:          fmt.Sprintf("profile-unrelated-recent-%03d", index),
+			RunID:       fmt.Sprintf("run-unrelated-recent-%03d", index),
+			ProfileType: "heap",
+			Status:      "collected",
+			FileName:    fmt.Sprintf("unrelated-%03d.pprof", index),
+			SizeBytes:   1,
+			StartedAt:   fmt.Sprintf("2026-06-17T12:%02d:%02dZ", index/60, index%60),
+			FinishedAt:  fmt.Sprintf("2026-06-17T12:%02d:%02dZ", index/60, index%60),
+		}
+		if _, err := artifactStore.save(artifact, nil); err != nil {
+			t.Fatalf("failed to save unrelated artifact %s: %v", artifact.ID, err)
+		}
+	}
+
+	response := httptest.NewRecorder()
+	NewRouter().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/reports/profile-artifacts/compare?runIds=run-explicit-artifact-new,run-explicit-artifact-old", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected explicit artifact comparison status %d, got %d with body %s", http.StatusOK, response.Code, response.Body.String())
+	}
+
+	var report struct {
+		Summary struct {
+			RunCount      int `json:"runCount"`
+			ArtifactCount int `json:"artifactCount"`
+		} `json:"summary"`
+		Groups []struct {
+			ProfileType string                  `json:"profileType"`
+			Artifacts   []profileArtifactRecord `json:"artifacts"`
+		} `json:"groups"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&report); err != nil {
+		t.Fatalf("expected profile artifact comparison JSON, got decode error: %v", err)
+	}
+	if report.Summary.RunCount != 2 || report.Summary.ArtifactCount != 2 {
+		t.Fatalf("expected explicit run artifact comparison to include both target artifacts, got %#v", report.Summary)
+	}
+	if len(report.Groups) != 1 || report.Groups[0].ProfileType != "cpu" || len(report.Groups[0].Artifacts) != 2 {
+		t.Fatalf("expected one cpu group with both explicit artifacts, got %#v", report.Groups)
+	}
+	if report.Groups[0].Artifacts[0].ID != "profile-explicit-new-cpu" || report.Groups[0].Artifacts[1].ID != "profile-explicit-old-cpu" {
+		t.Fatalf("expected latest-first explicit artifacts, got %#v", report.Groups[0].Artifacts)
 	}
 }
 

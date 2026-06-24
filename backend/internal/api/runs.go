@@ -442,6 +442,9 @@ func resolveCreateRunRequest(scenarioStore *scenarioStore, targetStore *targetSt
 		if !found {
 			return input, http.StatusNotFound, fmt.Errorf("target not found")
 		}
+		if !workspaceScopesMatch(scenario.ProjectID, scenario.Environment, target.ProjectID, target.Environment) {
+			return input, http.StatusForbidden, workspaceScopeError(scenario.ProjectID, scenario.Environment, normalizedWorkspaceScope(target.ProjectID, target.Environment))
+		}
 		input = applyTargetToRunRequest(input, target, scenario)
 	}
 	normalized, err := validateCreateRunRequest(input)
