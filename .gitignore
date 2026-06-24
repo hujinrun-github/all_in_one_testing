@@ -6,3 +6,6 @@ backend/.tmp/
 backend/data/*.db
 backend/data/*.db-*
 backend/data/*.json
+backend/data/*.log
+backend/data/profile-artifacts/
+backend/data/profile_artifacts/
