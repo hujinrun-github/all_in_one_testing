@@ -7,6 +7,12 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      window.__AIT_REPORT_BOOTSTRAP__ = function (payload) {
+        window.__AIT_LATEST_RUN_REPORT__ = payload;
+      };
+    </script>
+    <script vite-ignore src="/api/reports/latest?callback=window.__AIT_REPORT_BOOTSTRAP__"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

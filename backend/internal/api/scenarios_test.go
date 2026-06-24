@@ -31,6 +31,10 @@ func TestScenarioAPIPersistsScenariosToSQLite(t *testing.T) {
 		"bodyVariants": [
 			{ "name": "small-order", "weight": "70", "body": "{\"amount\":100}" }
 		],
+		"flowSteps": [
+			{ "id": "step-login", "name": "HTTP login", "type": "request", "protocol": "HTTP", "method": "POST", "path": "/login" },
+			{ "id": "step-assert", "name": "assert status", "type": "assertion", "assertion": "status < 400" }
+		],
 		"timeoutMs": "2500",
 		"retryCount": "2",
 		"assertion": "status < 400"
@@ -67,8 +71,17 @@ func TestScenarioAPIPersistsScenariosToSQLite(t *testing.T) {
 		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, listResponse.Code, listResponse.Body.String())
 	}
 	var listed []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		FlowSteps []struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Type      string `json:"type"`
+			Protocol  string `json:"protocol"`
+			Method    string `json:"method"`
+			Path      string `json:"path"`
+			Assertion string `json:"assertion"`
+		} `json:"flowSteps"`
 	}
 	if err := json.NewDecoder(listResponse.Body).Decode(&listed); err != nil {
 		t.Fatalf("expected scenario list JSON, got decode error: %v", err)
@@ -78,6 +91,12 @@ func TestScenarioAPIPersistsScenariosToSQLite(t *testing.T) {
 	}
 	if listed[0].ID != created.ID || listed[0].Name != "checkout-payment" {
 		t.Fatalf("expected persisted scenario %q, got %#v", created.ID, listed[0])
+	}
+	if len(listed[0].FlowSteps) != 2 {
+		t.Fatalf("expected two persisted flow steps, got %#v", listed[0].FlowSteps)
+	}
+	if listed[0].FlowSteps[0].Name != "HTTP login" || listed[0].FlowSteps[0].Protocol != "HTTP" || listed[0].FlowSteps[1].Assertion != "status < 400" {
+		t.Fatalf("expected persisted flow step details, got %#v", listed[0].FlowSteps)
 	}
 
 	databaseHeader := make([]byte, 16)
@@ -91,6 +110,83 @@ func TestScenarioAPIPersistsScenariosToSQLite(t *testing.T) {
 	}
 	if string(databaseHeader) != "SQLite format 3\x00" {
 		t.Fatalf("expected SQLite database header, got %q", string(databaseHeader))
+	}
+}
+
+func TestScenarioAPIStoresAndFiltersProjectEnvironment(t *testing.T) {
+	t.Setenv("SCENARIO_DB_PATH", filepath.Join(t.TempDir(), "scenarios.db"))
+	router := NewRouter()
+
+	createScenario := func(body string) struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		ProjectID   string `json:"projectId"`
+		Environment string `json:"environment"`
+	} {
+		t.Helper()
+
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/scenarios", bytes.NewBufferString(body)))
+		if response.Code != http.StatusCreated {
+			t.Fatalf("expected status %d, got %d with body %s", http.StatusCreated, response.Code, response.Body.String())
+		}
+
+		var created struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			ProjectID   string `json:"projectId"`
+			Environment string `json:"environment"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
+			t.Fatalf("expected created scenario JSON, got decode error: %v", err)
+		}
+		return created
+	}
+
+	checkout := createScenario(`{
+		"name": "checkout-staging-smoke",
+		"projectId": "project-checkout",
+		"environment": "staging",
+		"protocol": "HTTP",
+		"method": "GET",
+		"baseUrl": "http://checkout.example.test",
+		"path": "/api/health"
+	}`)
+	createScenario(`{
+		"name": "billing-prod-smoke",
+		"projectId": "project-billing",
+		"environment": "prod",
+		"protocol": "HTTP",
+		"method": "GET",
+		"baseUrl": "http://billing.example.test",
+		"path": "/api/health"
+	}`)
+
+	if checkout.ProjectID != "project-checkout" || checkout.Environment != "staging" {
+		t.Fatalf("expected created scenario to preserve project/environment, got %#v", checkout)
+	}
+
+	listResponse := httptest.NewRecorder()
+	router.ServeHTTP(listResponse, httptest.NewRequest(http.MethodGet, "/api/scenarios?projectId=project-checkout&environment=staging", nil))
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, listResponse.Code, listResponse.Body.String())
+	}
+
+	var listed []struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		ProjectID   string `json:"projectId"`
+		Environment string `json:"environment"`
+	}
+	if err := json.NewDecoder(listResponse.Body).Decode(&listed); err != nil {
+		t.Fatalf("expected scenario list JSON, got decode error: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("expected one matching scenario, got %d: %#v", len(listed), listed)
+	}
+	if listed[0].ID != checkout.ID || listed[0].Name != "checkout-staging-smoke" ||
+		listed[0].ProjectID != "project-checkout" || listed[0].Environment != "staging" {
+		t.Fatalf("expected filtered checkout staging scenario, got %#v", listed[0])
 	}
 }
 

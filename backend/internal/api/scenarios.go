@@ -16,11 +16,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const scenarioDatabasePathEnv = "SCENARIO_DB_PATH"
+const (
+	scenarioDatabasePathEnv    = "SCENARIO_DB_PATH"
+	defaultScenarioProjectID   = "default"
+	defaultScenarioEnvironment = "default"
+)
 
 type scenarioRecord struct {
 	ID            string                 `json:"id"`
 	Name          string                 `json:"name"`
+	ProjectID     string                 `json:"projectId"`
+	Environment   string                 `json:"environment"`
 	Protocol      string                 `json:"protocol"`
 	Method        string                 `json:"method"`
 	BaseURL       string                 `json:"baseUrl"`
@@ -28,11 +34,17 @@ type scenarioRecord struct {
 	QueryVariants []scenarioQueryVariant `json:"queryVariants"`
 	Headers       []scenarioHeader       `json:"headers"`
 	BodyVariants  []scenarioBodyVariant  `json:"bodyVariants"`
+	FlowSteps     []scenarioFlowStep     `json:"flowSteps"`
 	TimeoutMs     string                 `json:"timeoutMs"`
 	RetryCount    string                 `json:"retryCount"`
 	Assertion     string                 `json:"assertion"`
 	CreatedAt     string                 `json:"createdAt"`
 	UpdatedAt     string                 `json:"updatedAt"`
+}
+
+type scenarioListFilter struct {
+	ProjectID   string
+	Environment string
 }
 
 type scenarioQueryVariant struct {
@@ -52,22 +64,60 @@ type scenarioBodyVariant struct {
 	Body   string `json:"body"`
 }
 
+type scenarioFlowStep struct {
+	ID         string                      `json:"id"`
+	Name       string                      `json:"name"`
+	Type       string                      `json:"type"`
+	Enabled    bool                        `json:"enabled"`
+	Protocol   string                      `json:"protocol,omitempty"`
+	Method     string                      `json:"method,omitempty"`
+	Path       string                      `json:"path,omitempty"`
+	Assertion  string                      `json:"assertion,omitempty"`
+	Extractors []scenarioVariableExtractor `json:"extractors,omitempty"`
+	Assertions []scenarioResponseAssertion `json:"assertions,omitempty"`
+	When       *scenarioResponseAssertion  `json:"when,omitempty"`
+}
+
+type scenarioVariableExtractor struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	Path   string `json:"path"`
+}
+
+type scenarioResponseAssertion struct {
+	Name     string `json:"name"`
+	Source   string `json:"source"`
+	Path     string `json:"path,omitempty"`
+	Operator string `json:"operator"`
+	Expected string `json:"expected,omitempty"`
+}
+
 type scenarioStore struct {
 	path string
 	mu   sync.Mutex
 }
 
 func newScenarioStoreFromEnv() *scenarioStore {
+	return &scenarioStore{path: scenarioDatabasePathFromEnv()}
+}
+
+func scenarioDatabasePathFromEnv() string {
 	path := os.Getenv(scenarioDatabasePathEnv)
 	if path == "" {
 		path = filepath.Join("data", "platform.db")
 	}
-	return &scenarioStore{path: path}
+	return path
 }
 
 func handleListScenarios(store *scenarioStore) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		scenarios, err := store.list()
+	return func(w http.ResponseWriter, r *http.Request) {
+		filter := scenarioListFilterFromRequest(r)
+		if err := applyWorkspaceScopeToFilter(r, &filter.ProjectID, &filter.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+
+		scenarios, err := store.list(filter)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -82,6 +132,10 @@ func handleCreateScenario(store *scenarioStore) http.HandlerFunc {
 		var input scenarioRecord
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be valid JSON"})
+			return
+		}
+		if err := applyWorkspaceScopeToRecord(r, &input.ProjectID, &input.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
 		}
 
@@ -106,6 +160,10 @@ func handleGetScenario(store *scenarioStore) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scenario not found"})
 			return
 		}
+		if err := requireWorkspaceScopeForRecord(r, scenario.ProjectID, scenario.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
 
 		writeJSON(w, http.StatusOK, scenario)
 	}
@@ -116,6 +174,24 @@ func handleUpdateScenario(store *scenarioStore) http.HandlerFunc {
 		var input scenarioRecord
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body must be valid JSON"})
+			return
+		}
+
+		scenario, found, err := store.get(chi.URLParam(r, "id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scenario not found"})
+			return
+		}
+		if err := requireWorkspaceScopeForRecord(r, scenario.ProjectID, scenario.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := applyWorkspaceScopeToRecord(r, &input.ProjectID, &input.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 			return
 		}
 
@@ -135,7 +211,7 @@ func handleUpdateScenario(store *scenarioStore) http.HandlerFunc {
 
 func handleDeleteScenario(store *scenarioStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		found, err := store.delete(chi.URLParam(r, "id"))
+		scenario, found, err := store.get(chi.URLParam(r, "id"))
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -144,12 +220,33 @@ func handleDeleteScenario(store *scenarioStore) http.HandlerFunc {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scenario not found"})
 			return
 		}
+		if err := requireWorkspaceScopeForRecord(r, scenario.ProjectID, scenario.Environment); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
 
+		found, err = store.delete(chi.URLParam(r, "id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scenario not found"})
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
-func (store *scenarioStore) list() ([]scenarioRecord, error) {
+func scenarioListFilterFromRequest(r *http.Request) scenarioListFilter {
+	query := r.URL.Query()
+	return scenarioListFilter{
+		ProjectID:   strings.TrimSpace(query.Get("projectId")),
+		Environment: strings.TrimSpace(query.Get("environment")),
+	}
+}
+
+func (store *scenarioStore) list(filter scenarioListFilter) ([]scenarioRecord, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
@@ -159,12 +256,27 @@ func (store *scenarioStore) list() ([]scenarioRecord, error) {
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`
-		SELECT id, name, protocol, method, base_url, request_path, query_variants,
-			headers, body_variants, timeout_ms, retry_count, assertion, created_at, updated_at
+	query := `
+		SELECT id, name, project_id, environment, protocol, method, base_url, request_path, query_variants,
+			headers, body_variants, flow_steps, timeout_ms, retry_count, assertion, created_at, updated_at
 		FROM scenarios
-		ORDER BY created_at ASC
-	`)
+	`
+	conditions := []string{}
+	args := []any{}
+	if filter.ProjectID != "" {
+		conditions = append(conditions, "project_id = ?")
+		args = append(args, filter.ProjectID)
+	}
+	if filter.Environment != "" {
+		conditions = append(conditions, "environment = ?")
+		args = append(args, filter.Environment)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY created_at ASC"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,21 +311,21 @@ func (store *scenarioStore) create(input scenarioRecord) (scenarioRecord, error)
 	if err := validateScenario(input); err != nil {
 		return scenarioRecord{}, err
 	}
-	input.ID = fmt.Sprintf("scenario-%d", time.Now().UnixNano())
+	input.ID = newResourceID("scenario")
 	input.CreatedAt = now
 	input.UpdatedAt = now
 
-	queryVariants, headers, bodyVariants, err := encodeScenarioCollections(input)
+	queryVariants, headers, bodyVariants, flowSteps, err := encodeScenarioCollections(input)
 	if err != nil {
 		return scenarioRecord{}, err
 	}
 	_, err = db.Exec(`
 		INSERT INTO scenarios (
-			id, name, protocol, method, base_url, request_path, query_variants,
-			headers, body_variants, timeout_ms, retry_count, assertion, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, input.ID, input.Name, input.Protocol, input.Method, input.BaseURL, input.Path, queryVariants,
-		headers, bodyVariants, input.TimeoutMs, input.RetryCount, input.Assertion, input.CreatedAt, input.UpdatedAt)
+			id, name, project_id, environment, protocol, method, base_url, request_path, query_variants,
+			headers, body_variants, flow_steps, timeout_ms, retry_count, assertion, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, input.ID, input.Name, input.ProjectID, input.Environment, input.Protocol, input.Method, input.BaseURL, input.Path, queryVariants,
+		headers, bodyVariants, flowSteps, input.TimeoutMs, input.RetryCount, input.Assertion, input.CreatedAt, input.UpdatedAt)
 	if err != nil {
 		return scenarioRecord{}, err
 	}
@@ -256,18 +368,18 @@ func (store *scenarioStore) update(id string, input scenarioRecord) (scenarioRec
 	input.CreatedAt = existing.CreatedAt
 	input.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 
-	queryVariants, headers, bodyVariants, err := encodeScenarioCollections(input)
+	queryVariants, headers, bodyVariants, flowSteps, err := encodeScenarioCollections(input)
 	if err != nil {
 		return scenarioRecord{}, true, err
 	}
 	_, err = db.Exec(`
 		UPDATE scenarios
-		SET name = ?, protocol = ?, method = ?, base_url = ?, request_path = ?,
-			query_variants = ?, headers = ?, body_variants = ?, timeout_ms = ?,
+		SET name = ?, project_id = ?, environment = ?, protocol = ?, method = ?, base_url = ?, request_path = ?,
+			query_variants = ?, headers = ?, body_variants = ?, flow_steps = ?, timeout_ms = ?,
 			retry_count = ?, assertion = ?, updated_at = ?
 		WHERE id = ?
-	`, input.Name, input.Protocol, input.Method, input.BaseURL, input.Path,
-		queryVariants, headers, bodyVariants, input.TimeoutMs, input.RetryCount,
+	`, input.Name, input.ProjectID, input.Environment, input.Protocol, input.Method, input.BaseURL, input.Path,
+		queryVariants, headers, bodyVariants, flowSteps, input.TimeoutMs, input.RetryCount,
 		input.Assertion, input.UpdatedAt, id)
 	if err != nil {
 		return scenarioRecord{}, true, err
@@ -318,6 +430,8 @@ func ensureScenarioSchema(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS scenarios (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
+			project_id TEXT NOT NULL DEFAULT 'default',
+			environment TEXT NOT NULL DEFAULT 'default',
 			protocol TEXT NOT NULL,
 			method TEXT NOT NULL,
 			base_url TEXT NOT NULL,
@@ -325,6 +439,7 @@ func ensureScenarioSchema(db *sql.DB) error {
 			query_variants TEXT NOT NULL,
 			headers TEXT NOT NULL,
 			body_variants TEXT NOT NULL,
+			flow_steps TEXT NOT NULL DEFAULT '[]',
 			timeout_ms TEXT NOT NULL,
 			retry_count TEXT NOT NULL,
 			assertion TEXT NOT NULL,
@@ -332,6 +447,44 @@ func ensureScenarioSchema(db *sql.DB) error {
 			updated_at TEXT NOT NULL
 		)
 	`)
+	if err != nil {
+		return err
+	}
+	if err := ensureScenarioColumn(db, "flow_steps", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := ensureScenarioColumn(db, "project_id", "TEXT NOT NULL DEFAULT 'default'"); err != nil {
+		return err
+	}
+	return ensureScenarioColumn(db, "environment", "TEXT NOT NULL DEFAULT 'default'")
+}
+
+func ensureScenarioColumn(db *sql.DB, columnName string, definition string) error {
+	rows, err := db.Query("PRAGMA table_info(scenarios)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var columnType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == columnName {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE scenarios ADD COLUMN %s %s", columnName, definition))
 	return err
 }
 
@@ -341,8 +494,8 @@ type scenarioScanner interface {
 
 func getScenarioByID(db *sql.DB, id string) (scenarioRecord, bool, error) {
 	row := db.QueryRow(`
-		SELECT id, name, protocol, method, base_url, request_path, query_variants,
-			headers, body_variants, timeout_ms, retry_count, assertion, created_at, updated_at
+		SELECT id, name, project_id, environment, protocol, method, base_url, request_path, query_variants,
+			headers, body_variants, flow_steps, timeout_ms, retry_count, assertion, created_at, updated_at
 		FROM scenarios
 		WHERE id = ?
 	`, id)
@@ -361,10 +514,13 @@ func scanScenario(scanner scenarioScanner) (scenarioRecord, error) {
 	var queryVariants string
 	var headers string
 	var bodyVariants string
+	var flowSteps string
 
 	if err := scanner.Scan(
 		&scenario.ID,
 		&scenario.Name,
+		&scenario.ProjectID,
+		&scenario.Environment,
 		&scenario.Protocol,
 		&scenario.Method,
 		&scenario.BaseURL,
@@ -372,6 +528,7 @@ func scanScenario(scanner scenarioScanner) (scenarioRecord, error) {
 		&queryVariants,
 		&headers,
 		&bodyVariants,
+		&flowSteps,
 		&scenario.TimeoutMs,
 		&scenario.RetryCount,
 		&scenario.Assertion,
@@ -389,23 +546,30 @@ func scanScenario(scanner scenarioScanner) (scenarioRecord, error) {
 	if err := decodeScenarioCollection("bodyVariants", bodyVariants, &scenario.BodyVariants); err != nil {
 		return scenarioRecord{}, err
 	}
+	if err := decodeScenarioCollection("flowSteps", flowSteps, &scenario.FlowSteps); err != nil {
+		return scenarioRecord{}, err
+	}
 	return scenario, nil
 }
 
-func encodeScenarioCollections(scenario scenarioRecord) (string, string, string, error) {
+func encodeScenarioCollections(scenario scenarioRecord) (string, string, string, string, error) {
 	queryVariants, err := json.Marshal(scenario.QueryVariants)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	headers, err := json.Marshal(scenario.Headers)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	bodyVariants, err := json.Marshal(scenario.BodyVariants)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
-	return string(queryVariants), string(headers), string(bodyVariants), nil
+	flowSteps, err := json.Marshal(scenario.FlowSteps)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return string(queryVariants), string(headers), string(bodyVariants), string(flowSteps), nil
 }
 
 func decodeScenarioCollection(field string, data string, target any) error {
@@ -420,8 +584,13 @@ func decodeScenarioCollection(field string, data string, target any) error {
 
 func normalizeScenario(input scenarioRecord) scenarioRecord {
 	input.Name = strings.TrimSpace(input.Name)
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.Environment = strings.TrimSpace(input.Environment)
 	input.Protocol = strings.ToUpper(strings.TrimSpace(input.Protocol))
-	input.Method = strings.ToUpper(strings.TrimSpace(input.Method))
+	input.Method = strings.TrimSpace(input.Method)
+	if input.Protocol != "CUSTOM_RPC" {
+		input.Method = strings.ToUpper(input.Method)
+	}
 	input.BaseURL = strings.TrimSpace(input.BaseURL)
 	input.Path = strings.TrimSpace(input.Path)
 	input.TimeoutMs = strings.TrimSpace(input.TimeoutMs)
@@ -429,6 +598,12 @@ func normalizeScenario(input scenarioRecord) scenarioRecord {
 	input.Assertion = strings.TrimSpace(input.Assertion)
 	if input.Protocol == "" {
 		input.Protocol = "HTTP"
+	}
+	if input.ProjectID == "" {
+		input.ProjectID = defaultScenarioProjectID
+	}
+	if input.Environment == "" {
+		input.Environment = defaultScenarioEnvironment
 	}
 	if input.Method == "" {
 		input.Method = http.MethodGet
@@ -454,7 +629,127 @@ func normalizeScenario(input scenarioRecord) scenarioRecord {
 	if input.BodyVariants == nil {
 		input.BodyVariants = []scenarioBodyVariant{}
 	}
+	input.FlowSteps = normalizeScenarioFlowSteps(input.FlowSteps)
 	return input
+}
+
+func normalizeScenarioFlowSteps(steps []scenarioFlowStep) []scenarioFlowStep {
+	if steps == nil {
+		return []scenarioFlowStep{}
+	}
+
+	normalizedSteps := make([]scenarioFlowStep, 0, len(steps))
+	for _, step := range steps {
+		step.ID = strings.TrimSpace(step.ID)
+		step.Name = strings.TrimSpace(step.Name)
+		step.Type = strings.ToLower(strings.TrimSpace(step.Type))
+		step.Protocol = strings.ToUpper(strings.TrimSpace(step.Protocol))
+		step.Method = strings.ToUpper(strings.TrimSpace(step.Method))
+		step.Path = strings.TrimSpace(step.Path)
+		step.Assertion = strings.TrimSpace(step.Assertion)
+		step.Extractors = normalizeScenarioExtractors(step.Extractors)
+		step.Assertions = normalizeScenarioAssertions(step.Assertions)
+		step.When = normalizeScenarioCondition(step.When)
+		if step.Name == "" {
+			continue
+		}
+		if step.Type == "" {
+			step.Type = "request"
+		}
+		normalizedSteps = append(normalizedSteps, step)
+	}
+	return normalizedSteps
+}
+
+func normalizeScenarioExtractors(extractors []scenarioVariableExtractor) []scenarioVariableExtractor {
+	if extractors == nil {
+		return []scenarioVariableExtractor{}
+	}
+
+	normalizedExtractors := make([]scenarioVariableExtractor, 0, len(extractors))
+	for _, extractor := range extractors {
+		extractor.Name = strings.TrimSpace(extractor.Name)
+		extractor.Source = strings.ToLower(strings.TrimSpace(extractor.Source))
+		extractor.Path = strings.TrimSpace(extractor.Path)
+		if extractor.Source == "" {
+			extractor.Source = "json"
+		}
+		if extractor.Name == "" || extractor.Path == "" {
+			continue
+		}
+		normalizedExtractors = append(normalizedExtractors, extractor)
+	}
+	return normalizedExtractors
+}
+
+func normalizeScenarioAssertions(assertions []scenarioResponseAssertion) []scenarioResponseAssertion {
+	if assertions == nil {
+		return []scenarioResponseAssertion{}
+	}
+
+	normalizedAssertions := make([]scenarioResponseAssertion, 0, len(assertions))
+	for _, assertion := range assertions {
+		assertion.Name = strings.TrimSpace(assertion.Name)
+		assertion.Source = strings.ToLower(strings.TrimSpace(assertion.Source))
+		assertion.Path = strings.TrimSpace(assertion.Path)
+		assertion.Operator = normalizeScenarioAssertionOperator(assertion.Operator)
+		assertion.Expected = strings.TrimSpace(assertion.Expected)
+		if assertion.Source == "" {
+			assertion.Source = "body"
+		}
+		if assertion.Operator == "" {
+			assertion.Operator = "equals"
+		}
+		if assertion.Name == "" {
+			assertion.Name = assertion.Source
+			if assertion.Path != "" {
+				assertion.Name += " " + assertion.Path
+			}
+		}
+		if assertion.Source != "body" && assertion.Path == "" {
+			continue
+		}
+		if assertion.Operator != "exists" && assertion.Expected == "" {
+			continue
+		}
+		normalizedAssertions = append(normalizedAssertions, assertion)
+	}
+	return normalizedAssertions
+}
+
+func normalizeScenarioCondition(condition *scenarioResponseAssertion) *scenarioResponseAssertion {
+	if condition == nil {
+		return nil
+	}
+	normalized := normalizeScenarioAssertions([]scenarioResponseAssertion{*condition})
+	if len(normalized) == 0 {
+		return nil
+	}
+	return &normalized[0]
+}
+
+func normalizeScenarioAssertionOperator(operator string) string {
+	normalized := strings.ToLower(strings.TrimSpace(operator))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+	switch normalized {
+	case "", "eq", "equal", "equals", "==", "=":
+		return "equals"
+	case "ne", "not_equal", "not_equals", "notequals", "!=":
+		return "not_equals"
+	case "contains", "include", "includes":
+		return "contains"
+	case "not_contains", "notcontains", "excludes":
+		return "not_contains"
+	case "matches", "match", "regex", "=~":
+		return "matches"
+	case "not_matches", "notmatches", "not_match", "!~":
+		return "not_matches"
+	case "exists", "exist":
+		return "exists"
+	default:
+		return normalized
+	}
 }
 
 func validateScenario(input scenarioRecord) error {
