@@ -120,12 +120,12 @@ sudo systemctl enable --now all-in-one-agent.service
 
 ### Package Generation Approach
 
-The MVP builder writes minimal package files directly in Go:
+The MVP builder writes package files directly in Go:
 
 - Debian package: `ar` archive containing `debian-binary`, `control.tar.gz`, and `data.tar.gz`.
-- RPM package: minimal RPM v3/v4-compatible file with metadata and payload sufficient for `rpm -qip` and installation on common RPM systems.
+- RPM package: RPM output that is recognized by `rpm -qip`, `rpm -qlp`, and installs on common RPM systems.
 
-If direct RPM generation becomes too risky during implementation, the acceptable fallback is to generate a `.tar.gz` package plus an RPM metadata stub only after documenting that limitation in the implementation plan. The preferred design remains real `.rpm` output.
+RPM is part of the MVP acceptance criteria. Do not replace it with a `.tar.gz`, metadata stub, or UI-only placeholder. If real RPM generation proves too risky during implementation, stop and revise this design before changing the deliverable.
 
 ## WebSocket Run Control
 
@@ -229,6 +229,25 @@ All endpoints accept:
 - aborted count
 - canceled count
 
+### Historical Ownership Snapshot
+
+Target and process trends must not infer historical Target ownership from the current Target-Agent binding. Target bindings can change after a Run, and recalculating old metrics with the latest binding would produce incorrect history.
+
+Add a run-scoped binding snapshot at Run creation:
+
+- `runId`
+- `projectId`
+- `environment`
+- `targetId`
+- `targetName`
+- `targetBaseUrl`
+- `agentIds`
+- `processMatch`
+- `metricThresholds`
+- `createdAt`
+
+The snapshot is immutable. Target and process trend APIs only attribute Agent metric samples to a Target when the sample falls inside a Run window that has a matching run/target/agent snapshot. Free-running Agent metrics outside a Run window can still appear in Agent metric APIs, but they are not used for Target or Process historical trends unless a future design adds explicit long-lived Target ownership intervals.
+
 ### Target Trends
 
 `/api/reports/trends/targets` aggregates Agent metric samples aligned to Target ownership:
@@ -292,7 +311,18 @@ Query filters:
 - `projectId`
 - `environment`
 
-The response is a zip file containing matching stored files. The zip should include a `manifest.json` with artifact metadata and original file names. Missing files are skipped and recorded in the manifest under `missingArtifacts`.
+The response is a zip file containing matching stored files. The zip should include a `manifest.json` with artifact metadata and original file names. Missing files are skipped and recorded in the manifest under `missingArtifacts`; the HTTP response remains `200` when at least one artifact or manifest entry is produced, and the manifest is the authoritative partial-success report. If no artifact matches the filter, return `404`.
+
+Archive safety rules:
+
+- Maximum artifacts per archive: 200.
+- Maximum total uncompressed bytes per archive: 512 MiB.
+- If either limit would be exceeded, return `413` with a JSON error before writing the zip response.
+- Zip entries must be generated from sanitized names only: no absolute paths, no drive letters, no `..`, no empty path segments, and `/` is the only directory separator.
+- Duplicate file names are disambiguated with the artifact ID, for example `cpu.pprof` and `profile-123-cpu.pprof`.
+- Stored `storagePath` is used only as the file source on disk, never as the zip entry name.
+- Archive generation should stream to the response with `archive/zip`; it must not load all artifact payloads into memory at once.
+- The manifest records skipped artifacts with `reason` values such as `missing_file`, `deleted`, or `unsafe_name`.
 
 ### Retention Policy
 
@@ -304,8 +334,12 @@ PUT  /api/profile-artifact-retention
 POST /api/profile-artifacts/cleanup
 ```
 
+Retention policy is workspace-scoped, not global. The policy table is keyed by `projectId` and `environment`, and cleanup always operates inside exactly one workspace.
+
 Policy fields:
 
+- `projectId`
+- `environment`
 - `enabled`
 - `maxAgeDays`
 - `maxTotalBytes`
@@ -321,7 +355,9 @@ Cleanup response fields:
 - `errors`
 - `artifacts`
 
-`POST /api/profile-artifacts/cleanup?dryRun=true` performs a dry run. `dryRun=false` deletes files and marks records as archived or deleted according to the store model chosen during implementation.
+`GET` and `PUT /api/profile-artifact-retention` require header or query workspace scope and read/write only that workspace policy. `POST /api/profile-artifacts/cleanup?dryRun=true` performs a dry run for the scoped workspace. `dryRun=false` deletes files and marks records as archived or deleted according to the store model chosen during implementation.
+
+Unscoped cleanup is not allowed in the MVP. Requests without `projectId` / `environment` scope return `400` with `workspace scope is required for artifact cleanup`. A future administrator-only global policy can be added after real auth/RBAC exists.
 
 ### Store Model
 
@@ -355,18 +391,32 @@ Targets currently support metric thresholds and reports derive `target_metric` a
 Supported MVP action types:
 
 - `alert`: create report alert only.
-- `profile`: create a Profile Task for each bound Agent.
+- `profile`: create a Profile Task only for the Agent whose metric breached the threshold. If a breach is derived from Target-level data without an Agent identity, create one task per currently snapshotted bound Agent and record that fan-out in event metadata.
 - `stop_run`: stop the active Run when a threshold breach is observed.
 - `retain_artifacts`: tag artifacts from the Run with a retention reason so cleanup skips them until the configured age expires.
 
 ### Execution Semantics
 
-- Actions run after a metric breach is detected during or immediately after a Run.
+- A real-time threshold evaluator runs while the Run is active. It evaluates metric samples for the run's snapshotted Target-Agent bindings at a fixed interval, using the Run start time as the lower bound and the current time as the upper bound.
+- The existing after-run threshold profile scheduling becomes the fallback/final sweep for actions that are still meaningful after completion, such as `alert`, `profile`, and `retain_artifacts`.
+- `stop_run` is only executed by the real-time evaluator while the Run is active. During the final sweep, `stop_run` records a skipped action event instead of pretending to stop an already-terminal Run.
 - `alert` is always safe and should remain the default behavior.
 - `profile` reuses the existing Profile Task creation path and controlled template rules.
 - `stop_run` is only valid for active runs and is idempotent.
 - `retain_artifacts` affects cleanup policy, not immediate storage.
 - Each action creates a run event with type `threshold_action`.
+
+### Idempotency And Cooldown
+
+Each threshold action has a dedupe key:
+
+```text
+runId | targetId | agentId | metric | actionType | thresholdValue
+```
+
+The same action key can be executed once per Run by default. `profile` may optionally define `cooldownSeconds`; when present, the dedupe key is extended with a cooldown window bucket so long runs can take repeated samples without creating unbounded tasks. The default cooldown is one execution per Run.
+
+`stop_run` is idempotent: repeated attempts against an already stopping or terminal run create no additional stop request and append at most one `threshold_action` event for that action key.
 
 ### Failure Handling
 
@@ -381,6 +431,8 @@ Action failures must not crash the Run worker. The run event log records:
 
 Reports include these events in the alert/action timeline.
 
+`threshold_action` events store structured fields in `metadataJson`; Reports must read metadata instead of parsing the human-readable message.
+
 ## Workspace Scope And Security
 
 Every new REST endpoint and WebSocket endpoint must enforce workspace scope consistently with existing APIs:
@@ -388,11 +440,11 @@ Every new REST endpoint and WebSocket endpoint must enforce workspace scope cons
 - Header scope for REST where possible.
 - Query scope for download, archive, EventSource, and WebSocket links.
 - Cross-scope single-resource access returns `403`.
-- Unscoped requests preserve local prototype compatibility.
+- Unscoped requests preserve local prototype compatibility except for sensitive retention cleanup, which requires explicit workspace scope.
 
 Package downloads remain unscoped because Agent install artifacts are release assets, not workspace data.
 
-Artifact archive and cleanup are sensitive operations. The MVP relies on workspace scope and local deployment trust. Future auth/RBAC can add user-level authorization around the same handler boundaries.
+Artifact archive and cleanup are sensitive operations. Archive requires either explicit workspace scope or a `runId` / artifact set that resolves to one workspace; cross-scope results are rejected. Cleanup always requires explicit workspace scope. Future auth/RBAC can add user-level authorization around the same handler boundaries.
 
 ## Data Persistence
 
@@ -401,9 +453,10 @@ SQLite remains the only database for this slice.
 Expected schema additions:
 
 - Profile artifacts: archival and deletion metadata.
-- Retention policy: singleton key/value table or typed table.
+- Profile artifact retention policy: typed table keyed by `project_id` and `environment`.
 - Threshold actions: JSON field embedded in Target metric threshold config.
-- Run events: no new table needed; add `threshold_action` event type.
+- Run target-agent snapshots: immutable Run creation snapshot for historical Target and Process trends.
+- Run events: add `metadata_json TEXT NOT NULL DEFAULT '{}'` and support `threshold_action` event type.
 
 Existing migration style should be preserved: startup should add missing columns or tables without requiring a separate migration command.
 
@@ -439,14 +492,14 @@ Settings or Reports retention panel:
 
 Backend tests:
 
-- Package builder creates binary, checksum, manifest, deb, and rpm entries.
+- Package builder creates binary, checksum, manifest, deb, and rpm entries. The RPM test must verify the file has an RPM header and can expose package metadata; if the test environment has `rpm`, also run `rpm -qip` and `rpm -qlp` against the generated artifact.
 - `/agent/binaries/{name}` serves package files and checksums.
 - WebSocket endpoint sends initial state, streams events, handles `ping`, and handles `stop`.
-- Trend endpoints aggregate seeded run, target metric, process, and artifact records.
-- Archive endpoint returns a zip with expected files and manifest.
-- Retention cleanup dry run reports matches without deleting files.
-- Retention cleanup delete mode removes files and updates metadata.
-- Threshold actions create expected Profile Tasks, stop active runs, and append `threshold_action` events.
+- Trend endpoints aggregate seeded run, target metric, process, and artifact records using run target-agent snapshots, not the current Target binding.
+- Archive endpoint returns a zip with expected files and manifest, rejects unsafe zip entry names, disambiguates duplicate names, skips missing files in the manifest, and returns `413` when file count or byte limits would be exceeded.
+- Retention cleanup dry run requires workspace scope and reports matches without deleting files.
+- Retention cleanup delete mode deletes only scoped workspace files and updates metadata.
+- Threshold actions create expected Profile Tasks for breached Agents, stop active runs during real-time evaluation, skip `stop_run` during final sweeps, apply dedupe/cooldown semantics, and append `threshold_action` events with `metadataJson`.
 - Workspace scope rejects cross-scope archive, cleanup, WebSocket, and trend access.
 
 Frontend tests:
