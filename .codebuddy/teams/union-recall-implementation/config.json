@@ -1,0 +1,28 @@
+{
+  "name": "union-recall-implementation",
+  "leadAgentId": "9f6d9f4442f446a791ea0880abcf04a2",
+  "workspacePath": "/Users/hujineun/gitProject/all_in_one_testing",
+  "createdAt": "2026-06-26T07:39:33.971Z",
+  "options": {
+    "workspacePath": "/Users/hujineun/gitProject/all_in_one_testing",
+    "isAutoTeam": false
+  },
+  "members": [
+    {
+      "memberId": "team-lead@union-recall-implementation",
+      "name": "team-lead",
+      "role": "Team Lead - coordinates the team and interacts with the user"
+    },
+    {
+      "memberId": "executor-a@union-recall-implementation",
+      "name": "executor-a",
+      "role": "生成 Union Recall 实现执行方案"
+    },
+    {
+      "memberId": "reviewer-b@union-recall-implementation",
+      "name": "reviewer-b",
+      "role": "审核 Union Recall 实现执行方案"
+    }
+  ],
+  "isAutoTeam": false
+}

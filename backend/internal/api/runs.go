@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"all_in_one_testing/backend/internal/rpc"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -34,6 +37,15 @@ const (
 	runProtocolHTTP      = "HTTP"
 	runProtocolCustomRPC = "CUSTOM_RPC"
 )
+
+// supportedProtocols 支持的协议列表
+var supportedProtocols = map[string]bool{
+	"HTTP":       true,
+	"CUSTOM_RPC": true,
+	"gRPC":       true, // 新增：gRPC 插件
+	"Dubbo":      true, // 新增：Dubbo 插件（暂未实现）
+	"Thrift":     true, // 新增：Thrift 插件（暂未实现）
+}
 
 type createRunRequest struct {
 	ScenarioID          string             `json:"scenarioId,omitempty"`
@@ -114,6 +126,7 @@ type runSample struct {
 	statusCode int
 	success    bool
 	error      string
+	body       []byte
 }
 
 type httpRequestOutcome struct {
@@ -627,8 +640,8 @@ func validateCreateRunRequest(input createRunRequest) (createRunRequest, error) 
 	if input.Protocol == "" {
 		input.Protocol = runProtocolHTTP
 	}
-	if input.Protocol != runProtocolHTTP && input.Protocol != runProtocolCustomRPC {
-		return input, fmt.Errorf("protocol must be HTTP or CUSTOM_RPC")
+	if !supportedProtocols[input.Protocol] {
+		return input, fmt.Errorf("unsupported protocol: %s, supported protocols: HTTP, CUSTOM_RPC, gRPC, Dubbo, Thrift", input.Protocol)
 	}
 	input.URL = strings.TrimSpace(input.URL)
 	if input.URL == "" {
@@ -679,6 +692,14 @@ func validateCreateRunRequest(input createRunRequest) (createRunRequest, error) 
 			input.Name = "ad-hoc-http-run"
 		}
 	}
+
+	// gRPC 协议特定验证
+	if strings.EqualFold(input.Protocol, "gRPC") {
+		if err := validateGRPCRequest(input); err != nil {
+			return input, err
+		}
+	}
+
 	input.Headers = normalizeRunHeaders(input.Headers)
 	if err := validateBodyVariants(input.BodyVariants); err != nil {
 		return input, err
@@ -688,6 +709,15 @@ func validateCreateRunRequest(input createRunRequest) (createRunRequest, error) 
 	}
 	input.Assertion = strings.TrimSpace(input.Assertion)
 	return input, nil
+}
+
+// validateGRPCRequest 验证 gRPC 请求的必需字段
+func validateGRPCRequest(input createRunRequest) error {
+	headers := runHeadersToMap(input.Headers)
+	if headers["X-GRPC-Target"] == "" {
+		return fmt.Errorf("gRPC protocol requires X-GRPC-Target header")
+	}
+	return nil
 }
 
 func normalizeRunHeaders(headers []runHeader) []runHeader {
@@ -782,10 +812,137 @@ func executeRunWithProgress(ctx context.Context, input createRunRequest, onProgr
 }
 
 func executeRunSample(ctx context.Context, client *http.Client, input createRunRequest) runSample {
+	// HTTP 协议使用原有逻辑
+	if strings.EqualFold(input.Protocol, runProtocolHTTP) {
+		return executeHTTPSample(ctx, client, input)
+	}
+
+	// CUSTOM_RPC 协议继续使用原有逻辑（HTTP Adapter）
 	if strings.EqualFold(input.Protocol, runProtocolCustomRPC) {
 		return executeCustomRPCSample(ctx, client, input)
 	}
-	return executeHTTPSample(ctx, client, input)
+
+	// 其他协议尝试使用插件
+	return executePluginSample(ctx, input)
+}
+
+// executePluginSample 使用插件执行样本
+func executePluginSample(ctx context.Context, input createRunRequest) runSample {
+	startedAt := time.Now()
+
+	// 构造插件请求
+	pluginReq := &rpc.PluginRequest{
+		Method:      input.Method,
+		Headers:     runHeadersToMap(input.Headers),
+		QueryParams: requestQuery(input, nil),
+		Body:        customRPCBodyValue(selectRunBody(input, nil)),
+		RunID:       input.RunID,
+		ScenarioID:  input.ScenarioID,
+		TargetID:    input.TargetID,
+		TargetName:  input.TargetName,
+	}
+
+	// 检查是否有对应插件
+	if !rpc.DefaultManager.HasPlugin(input.Protocol) {
+		// 无插件，尝试使用 HTTP Adapter
+		adapterURL := rpc.DefaultManager.GetAdapterURL(input.Protocol)
+		if adapterURL == "" {
+			// 既无插件也无 Adapter，返回错误
+			return runSample{
+				latency:   time.Since(startedAt),
+				error:     fmt.Sprintf("unknown protocol: %s, no plugin or adapter configured", input.Protocol),
+				success:   false,
+				statusCode: 0,
+			}
+		}
+		// 使用 HTTP Adapter（复用现有 executeCustomRPCSample 逻辑）
+		return executeCustomRPCSample(ctx, nil, input)
+	}
+
+	// 执行插件调用
+	plugin, ok := rpc.DefaultManager.Get(input.Protocol)
+	if !ok {
+		return runSample{
+			latency:   time.Since(startedAt),
+			error:     fmt.Sprintf("plugin not found: %s", input.Protocol),
+			success:   false,
+			statusCode: 0,
+		}
+	}
+
+	pluginResp, err := plugin.Execute(ctx, pluginReq)
+	if err != nil {
+		// 【gRPC 自动降级】如果 gRPC 插件返回不支持直接调用的错误，自动降级到 HTTP Adapter
+		if input.Protocol == "gRPC" && isGRPCDirectCallNotSupported(err) {
+			log.Printf("gRPC direct call not supported, fallback to HTTP Adapter: %v", err)
+			// 检查是否有配置 HTTP Adapter
+			adapterURL := rpc.DefaultManager.GetAdapterURL("gRPC")
+			if adapterURL != "" && adapterClient != nil {
+				// 使用 HTTP Adapter 执行
+				return executeHTTPAdapterForGRPC(ctx, adapterURL, pluginReq)
+			}
+			// 无 Adapter 配置，返回更友好的错误信息
+			return runSample{
+				latency:   time.Since(startedAt),
+				error:     "gRPC direct call not supported. Please configure gRPC HTTP Adapter URL in settings.",
+				success:   false,
+				statusCode: 0,
+			}
+		}
+		return runSample{
+			latency:   time.Since(startedAt),
+			error:     err.Error(),
+			success:   false,
+			statusCode: 0,
+		}
+	}
+
+	return runSample{
+		latency:    time.Since(startedAt),
+		error:      pluginResp.Error,
+		success:    pluginResp.Success,
+		statusCode: pluginResp.StatusCode,
+		body:       []byte(fmt.Sprintf("%v", pluginResp.Data)),
+	}
+}
+
+// isGRPCDirectCallNotSupported 检查是否是 gRPC 直接调用不支持的错误
+func isGRPCDirectCallNotSupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "gRPC direct call not supported")
+}
+
+// executeHTTPAdapterForGRPC 使用 HTTP Adapter 执行 gRPC 调用
+func executeHTTPAdapterForGRPC(ctx context.Context, adapterURL string, req *rpc.PluginRequest) runSample {
+	startedAt := time.Now()
+
+	// 如果没有 adapterClient，返回错误
+	if adapterClient == nil {
+		return runSample{
+			latency:   time.Since(startedAt),
+			error:     "HTTP Adapter client not initialized",
+			success:   false,
+			statusCode: 0,
+		}
+	}
+
+	// 调用 HTTP Adapter
+	resp, err := adapterClient.ExecuteWithProtocol(ctx, "gRPC", req)
+	if err != nil {
+		return runSample{
+			latency:   time.Since(startedAt),
+			error:     fmt.Sprintf("gRPC adapter call failed: %v", err),
+			success:   false,
+			statusCode: 0,
+		}
+	}
+
+	return runSample{
+		latency:    time.Since(startedAt),
+		error:      resp.Error,
+		success:    resp.Success,
+		statusCode: resp.StatusCode,
+		body:       []byte(fmt.Sprintf("%v", resp.Data)),
+	}
 }
 
 func guardrailExceeded(input createRunRequest, snapshot createRunResponse) bool {
@@ -1645,6 +1802,20 @@ func (progress *runProgress) snapshot(status string) createRunResponse {
 		CreatedAt:           createdAt,
 		SlowSamples:         append([]runRequestSampleRecord(nil), progress.slowSamples...),
 		ErrorSamples:        append([]runRequestSampleRecord(nil), progress.errorSamples...),
+	}
+}
+
+// 全局 Adapter 客户端
+var adapterClient *rpc.HTTPAdapterClient
+
+// initAdapter 初始化 Adapter 客户端
+func initAdapter(adapterURL string) {
+	if adapterURL != "" {
+		adapterClient = rpc.NewHTTPAdapterClient(&rpc.AdapterConfig{
+			URL:        adapterURL,
+			TimeoutMs:  30000,
+			MaxRetries: 2,
+		})
 	}
 }
 

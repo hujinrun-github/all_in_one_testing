@@ -86,6 +86,7 @@ type ScenarioFlowStep = {
   method?: string;
   path?: string;
   assertion?: string;
+  headers?: HeaderPair[];
   extractors?: ScenarioVariableExtractor[];
   assertions?: ScenarioResponseAssertion[];
   when?: ScenarioResponseAssertion;
@@ -816,8 +817,11 @@ function readBootstrapRunReport(): RunReportRecord | null {
 }
 
 const protocolOptions = [
-  { label: 'HTTP', value: 'HTTP' },
-  { label: 'Custom RPC', value: 'CUSTOM_RPC' },
+  { label: 'HTTP', value: 'HTTP', description: '标准 HTTP 协议' },
+  { label: 'Custom RPC (HTTP Adapter)', value: 'CUSTOM_RPC', description: '自定义 RPC 协议，通过 HTTP Adapter 调用' },
+  { label: 'gRPC', value: 'gRPC', description: 'gRPC 协议，推荐使用 HTTP Adapter + grpc-gateway' },
+  { label: 'Dubbo', value: 'Dubbo', description: 'Dubbo 协议，暂未实现' },
+  { label: 'Thrift', value: 'Thrift', description: 'Thrift 协议，暂未实现' },
 ];
 
 const methodOptions = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((method) => ({
@@ -1236,7 +1240,43 @@ function scenarioFlowStepLabel(step: ScenarioFlowStep, index: number): string {
 function isExecutableScenarioFlowStep(step: ScenarioFlowStep): boolean {
   const type = (step.type || '').toLowerCase();
   const protocol = (step.protocol || 'HTTP').toUpperCase();
-  return Boolean(step.enabled) && type === 'request' && protocol === 'HTTP' && Boolean(step.path?.trim());
+  
+  // 支持的协议列表
+  const supportedProtocols = ['HTTP', 'CUSTOM_RPC', 'gRPC', 'Dubbo', 'Thrift'];
+  
+  // 检查协议是否支持
+  if (!supportedProtocols.includes(protocol)) {
+    return false;
+  }
+  
+  // 必须是 request 类型
+  if (type !== 'request') {
+    return false;
+  }
+  
+  // gRPC 协议需要目标地址
+  if (protocol === 'gRPC') {
+    const headers = step.headers || [];
+    const hasTarget = headers.some((h: { key: string; value: string }) => h.key === 'X-GRPC-Target');
+    if (!hasTarget) {
+      return false;
+    }
+  }
+  
+  // CUSTOM_RPC 和 gRPC 需要 method
+  if (protocol === 'CUSTOM_RPC' || protocol === 'gRPC') {
+    if (!step.method?.trim()) {
+      return false;
+    }
+  }
+  
+  // HTTP 协议需要 path
+  if (protocol === 'HTTP') {
+    return Boolean(step.enabled) && Boolean(step.path?.trim());
+  }
+  
+  // 其他协议需要 path 或 method
+  return Boolean(step.enabled) && (Boolean(step.path?.trim()) || Boolean(step.method?.trim()));
 }
 
 function isActiveScenarioFlowStep(step: ScenarioFlowStep): boolean {
